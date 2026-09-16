@@ -43,6 +43,7 @@ byteorder.workspace = true
 bytes.workspace = true
 chrono.workspace = true
 clap = { version = "4.1.1", features = ["derive"], optional = true }
+nvtx = { version = "1", optional = true }
 crossbeam-skiplist.workspace = true
 # This is already used by datafusion
 dashmap = "6"
@@ -125,6 +126,9 @@ default = ["aws", "azure", "gcp", "oss", "huggingface", "tencent", "geo"]
 fp16kernels = ["lance-linalg/fp16kernels"]
 # Prevent dynamic linking of lzma, which comes from datafusion
 cli = ["dep:clap", "lzma-sys/static"]
+# Diagnostic-only: NVTX ranges/marks for profiling with nsys. Off by default
+# so the core crate stays CUDA/profiler-tooling agnostic.
+nvtx-profiling = ["dep:nvtx"]
 dynamodb = ["lance-table/dynamodb", "dep:aws-sdk-dynamodb"]
 dynamodb_tests = ["dynamodb"]
 substrait = ["lance-datafusion/substrait"]

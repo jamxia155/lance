@@ -78,6 +78,7 @@ bytes = "1.4"
 default = []
 datagen = ["lance-datagen"]
 fp16kernels = ["lance/fp16kernels"]
+nvtx-profiling = ["lance/nvtx-profiling"]
 
 [profile.ci]
 debug = "line-tables-only"

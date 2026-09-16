@@ -94,6 +94,45 @@ use super::{
 // the number of partitions to evaluate for reassigning
 const REASSIGN_RANGE: usize = 64;
 
+/// Point-in-time NVTX marker, safe to call from any thread with no pairing
+/// requirement. Used (instead of a push/pop range) for spans that cross an
+/// `.await`, where a multi-threaded Tokio runtime may resume the task on a
+/// different worker thread and would otherwise corrupt a thread-local
+/// push/pop stack. No-op unless built with `--features nvtx-profiling`.
+#[cfg(feature = "nvtx-profiling")]
+fn nvtx_mark(message: &str) {
+    nvtx::mark!("{}", message);
+}
+#[cfg(not(feature = "nvtx-profiling"))]
+fn nvtx_mark(_message: &str) {}
+
+/// RAII NVTX range, safe only for spans with no `.await` inside (see
+/// `nvtx_mark` above for why). Closes correctly on early return via `?`.
+/// No-op unless built with `--features nvtx-profiling`.
+#[cfg(feature = "nvtx-profiling")]
+struct NvtxSpan;
+#[cfg(feature = "nvtx-profiling")]
+impl NvtxSpan {
+    fn new(message: &str) -> Self {
+        nvtx::range_push!("{}", message);
+        Self
+    }
+}
+#[cfg(feature = "nvtx-profiling")]
+impl Drop for NvtxSpan {
+    fn drop(&mut self) {
+        nvtx::range_pop!();
+    }
+}
+#[cfg(not(feature = "nvtx-profiling"))]
+struct NvtxSpan;
+#[cfg(not(feature = "nvtx-profiling"))]
+impl NvtxSpan {
+    fn new(_message: &str) -> Self {
+        Self
+    }
+}
+
 // Builder for IVF index
 // The builder will train the IVF model and quantizer, shuffle the dataset, and build the sub index
 // for each partition.
@@ -883,6 +922,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                         _ => partition,
                     };
                     async move {
+                        nvtx_mark(&format!("lance/take_start[{partition}]"));
                         let take_start = Instant::now();
                         let (mut batches, loss) = if skip_existing_batches {
                             (Vec::new(), 0.0)
@@ -895,9 +935,14 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                             .await?
                         };
                         let take_elapsed = take_start.elapsed();
+                        nvtx_mark(&format!("lance/take_end[{partition}]"));
 
                         let build_start = Instant::now();
                         let part = spawn_cpu(move || {
+                            // Fully synchronous (no `.await` inside `spawn_cpu`'s
+                            // closure), so an NVTX push/pop range is safe here,
+                            // unlike the `take` span above which crosses one.
+                            let _span = NvtxSpan::new(&format!("lance/build_index[{partition}]"));
                             if let Some((assign_batch, deleted_row_ids)) = assign_batch {
                                 if !deleted_row_ids.is_empty() {
                                     let deleted_row_ids = HashSet::<u64>::from_iter(
@@ -1058,6 +1103,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
     #[instrument(name = "merge_partitions", level = "debug", skip_all)]
     async fn merge_partitions(&mut self, mut build_stream: BuildStream<S, Q>) -> Result<()> {
+        nvtx_mark("lance/merge_partitions_start");
         let Some(ivf) = self.ivf.as_ref() else {
             return Err(Error::invalid_input("IVF not set before merge partitions"));
         };
@@ -1331,6 +1377,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         );
 
         log::info!("merging {} partitions done", ivf.num_partitions());
+        nvtx_mark("lance/merge_partitions_end");
 
         Ok(())
     }

@@ -310,6 +310,15 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
     pub async fn build(&mut self) -> Result<usize> {
         let progress = self.progress.clone();
 
+        // Instrumentation for the previously-unlit gap between an external
+        // caller's GPU-side work (e.g. lance-cuvs's training/transform
+        // pipeline) finishing and `merge_partitions` starting. In particular,
+        // `load_or_build_ivf`/`load_or_build_quantizer` below silently fall
+        // back to a full CPU-side resample-and-retrain if `self.ivf`/
+        // `self.quantizer` weren't already populated with precomputed
+        // values -- these marks make that fallback visible (as a large
+        // `train_quantizer` span) instead of it hiding inside an opaque gap.
+        nvtx_mark("lance/build_train_ivf_start");
         // step 1. train IVF & quantizer
         let max_iters = self.ivf_params.as_ref().map(|p| p.max_iters as u64);
         progress
@@ -317,17 +326,22 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             .await?;
         self.with_ivf(self.load_or_build_ivf().boxed().await?);
         progress.stage_complete("train_ivf").await?;
+        nvtx_mark("lance/build_train_ivf_end");
 
+        nvtx_mark("lance/build_train_quantizer_start");
         progress.stage_start("train_quantizer", None, "").await?;
         self.with_quantizer(self.load_or_build_quantizer().await?);
         progress.stage_complete("train_quantizer").await?;
+        nvtx_mark("lance/build_train_quantizer_end");
 
         // step 2. shuffle the dataset
         if self.shuffle_reader.is_none() {
+            nvtx_mark("lance/build_shuffle_start");
             let num_rows = self.num_rows_to_shuffle().await?;
             progress.stage_start("shuffle", num_rows, "rows").await?;
             self.shuffle_dataset().boxed().await?;
             progress.stage_complete("shuffle").await?;
+            nvtx_mark("lance/build_shuffle_end");
         }
 
         // step 3. build and merge partitions
@@ -335,7 +349,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         progress
             .stage_start("merge_partitions", num_partitions, "partitions")
             .await?;
+        nvtx_mark("lance/build_partitions_start");
         let build_idx_stream = self.build_partitions().boxed().await?;
+        nvtx_mark("lance/build_partitions_end");
         self.merge_partitions(build_idx_stream).await?;
         progress.stage_complete("merge_partitions").await?;
 

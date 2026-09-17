@@ -482,6 +482,31 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 "dataset not set before loading or building quantizer",
             ));
         };
+
+        // Mirrors `build_ivf_model`'s precomputed-centroids short-circuit
+        // (in ivf.rs): if the caller already supplied a trained quantizer
+        // artifact (e.g. a PQ codebook trained on a GPU), `Quantization::
+        // build` will ignore its `data` argument entirely and return
+        // immediately -- so sampling training data for it first, as the code
+        // below does unconditionally, is pure wasted work. Skip straight to
+        // `Q::build` with an empty array of the right type instead.
+        if let Some(quantizer_params) = self.quantizer_params.as_ref() {
+            if quantizer_params.is_precomputed() {
+                info!("Pre-computed quantizer artifact is provided, skip quantizer training");
+                let (vector_type, _) = get_vector_type(dataset.schema(), &self.column)?;
+                let empty_data = arrow_array::new_empty_array(&vector_type);
+                // Match the slow path below: cosine is handled by
+                // normalizing vectors and treating distance as L2 from here
+                // on, so the quantizer itself is always built/stored as L2.
+                let quantizer_distance_type = if self.distance_type == DistanceType::Cosine {
+                    DistanceType::L2
+                } else {
+                    self.distance_type
+                };
+                return Q::build(empty_data.as_ref(), quantizer_distance_type, quantizer_params);
+            }
+        }
+
         let sample_size_hint = match &self.quantizer_params {
             Some(params) => params.sample_size(),
             None => 256 * 256, // here it must be retrain, let's just set sample size to the default value

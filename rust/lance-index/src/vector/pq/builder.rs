@@ -65,6 +65,10 @@ impl QuantizerBuildParams for PQBuildParams {
     fn use_residual(distance_type: DistanceType) -> bool {
         matches!(distance_type, DistanceType::L2 | DistanceType::Cosine)
     }
+
+    fn is_precomputed(&self) -> bool {
+        self.codebook.is_some()
+    }
 }
 
 impl PQBuildParams {

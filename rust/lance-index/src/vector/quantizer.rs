@@ -103,6 +103,13 @@ pub trait QuantizerBuildParams: Send + Sync {
     fn use_residual(_: DistanceType) -> bool {
         false
     }
+    /// Whether these params already carry a precomputed quantizer artifact
+    /// (e.g. a PQ codebook trained elsewhere, such as on a GPU). When true,
+    /// callers building a quantizer should skip sampling training data
+    /// entirely -- `Quantization::build` will not use it.
+    fn is_precomputed(&self) -> bool {
+        false
+    }
 }
 
 impl QuantizerBuildParams for () {

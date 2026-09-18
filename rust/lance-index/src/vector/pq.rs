@@ -49,7 +49,12 @@ pub struct ProductQuantizer {
     /// Pre-transposed L2 targets per sub-vector for fast f32 L2 batch computation.
     /// Only populated when codebook is f32 and distance_type is L2
     /// (Cosine is converted to L2 before construction, so it benefits too).
-    l2_targets: Option<Vec<L2Prepared>>,
+    ///
+    /// `Arc`-wrapped because `ProductQuantizer` is cloned once per partition
+    /// when building an IVF_PQ index (see `IvfIndexBuilder::build_partitions`);
+    /// without the `Arc`, each clone would deep-copy every sub-vector's
+    /// transposed centroid table.
+    l2_targets: Option<Arc<Vec<L2Prepared>>>,
 }
 
 impl DeepSizeOf for ProductQuantizer {
@@ -74,7 +79,7 @@ impl ProductQuantizer {
         num_sub_vectors: usize,
         num_bits: u32,
         dimension: usize,
-    ) -> Option<Vec<L2Prepared>> {
+    ) -> Option<Arc<Vec<L2Prepared>>> {
         if codebook.value_type() != DataType::Float32 || distance_type != DistanceType::L2 {
             return None;
         }
@@ -93,7 +98,7 @@ impl ProductQuantizer {
                 L2Prepared::new(block, sub_dim)
             })
             .collect();
-        Some(targets)
+        Some(Arc::new(targets))
     }
 
     pub fn new(

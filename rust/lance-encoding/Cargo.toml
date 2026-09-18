@@ -42,6 +42,7 @@ bytemuck = { version = "1.14", features = ["extern_crate_alloc"] }
 byteorder.workspace = true
 lz4 = { version = "1", optional = true }
 zstd = { version = "0.13", optional = true }
+nvtx = { version = "1", optional = true }
 
 [dev-dependencies]
 lance-testing.workspace = true
@@ -66,6 +67,9 @@ pprof = { workspace = true }
 default = ["lz4", "zstd", "bitpacking"]
 protoc = ["dep:protobuf-src"]
 bitpacking = ["dep:lance-bitpacking"]
+# Diagnostic-only: NVTX ranges/timers for profiling with nsys. Off by
+# default so this crate stays CUDA/profiler-tooling agnostic.
+nvtx-profiling = ["dep:nvtx"]
 lz4 = ["dep:lz4"]
 zstd = ["dep:zstd"]
 

@@ -128,7 +128,7 @@ fp16kernels = ["lance-linalg/fp16kernels"]
 cli = ["dep:clap", "lzma-sys/static"]
 # Diagnostic-only: NVTX ranges/marks for profiling with nsys. Off by default
 # so the core crate stays CUDA/profiler-tooling agnostic.
-nvtx-profiling = ["dep:nvtx"]
+nvtx-profiling = ["dep:nvtx", "lance-encoding/nvtx-profiling"]
 dynamodb = ["lance-table/dynamodb", "dep:aws-sdk-dynamodb"]
 dynamodb_tests = ["dynamodb"]
 substrait = ["lance-datafusion/substrait"]

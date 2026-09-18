@@ -12,6 +12,37 @@ use std::{
     vec,
 };
 
+/// RAII NVTX range. Only safe for fully synchronous spans (no `.await`
+/// inside) -- push/pop is nested/thread-local, and a multi-threaded Tokio
+/// runtime resuming an async task on a different worker thread would
+/// corrupt it. No-op unless built with `--features nvtx-profiling`; no
+/// `eprintln!` companion here deliberately, since this is used inside a
+/// per-chunk decode path that may run far too often to print per-call
+/// without flooding stderr -- nsys is the intended consumer.
+#[cfg(feature = "nvtx-profiling")]
+struct NvtxSpan;
+#[cfg(feature = "nvtx-profiling")]
+impl NvtxSpan {
+    fn new(message: &str) -> Self {
+        nvtx::range_push!("{}", message);
+        Self
+    }
+}
+#[cfg(feature = "nvtx-profiling")]
+impl Drop for NvtxSpan {
+    fn drop(&mut self) {
+        nvtx::range_pop!();
+    }
+}
+#[cfg(not(feature = "nvtx-profiling"))]
+struct NvtxSpan;
+#[cfg(not(feature = "nvtx-profiling"))]
+impl NvtxSpan {
+    fn new(_message: &str) -> Self {
+        Self
+    }
+}
+
 use crate::{
     constants::{
         STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK,
@@ -543,6 +574,7 @@ impl DecodeMiniBlockTask {
 
 impl DecodePageTask for DecodeMiniBlockTask {
     fn decode(self: Box<Self>) -> Result<DecodedPage> {
+        let _decode_span = NvtxSpan::new("lance_encoding/decode_miniblock_task");
         // First, we create output buffers for the rep and def and data
         let mut repbuf: Option<LevelBuffer> = None;
         let mut defbuf: Option<LevelBuffer> = None;
@@ -574,6 +606,13 @@ impl DecodePageTask for DecodeMiniBlockTask {
         let mut chunk_cache: Option<(usize, DecodedMiniBlockChunk)> = None;
 
         // Now we iterate through each instruction and process it
+        //
+        // Separate span from the whole-function one above: this isolates the
+        // per-chunk loop itself (decode_miniblock_chunk + data_builder
+        // append, run up to ~156K times per batch for our test workload)
+        // from setup/teardown, without pushing/popping per iteration -- that
+        // would add its own measurable overhead at this call volume.
+        let _loop_span = NvtxSpan::new("lance_encoding/decode_miniblock_loop");
         for (idx, (instructions, chunk)) in self.instructions.iter().enumerate() {
             let should_cache_this_chunk = needs_caching[idx];
 
@@ -624,6 +663,13 @@ impl DecodePageTask for DecodeMiniBlockTask {
             level_offset += (level_range.end - level_range.start) as usize;
             data_builder.append(&values, item_range);
         }
+        // Explicit drop rather than relying on the whole-function span's own
+        // scope: closes the loop-only span right here, so it doesn't also
+        // cover the finish()/unraveler/dictionary work below. The early
+        // `return Err(...)` inside the loop above still closes this span
+        // correctly too -- Rust drops in-scope locals on any exit path, not
+        // just when a block's closing brace is reached normally.
+        drop(_loop_span);
 
         let mut data = data_builder.finish();
 

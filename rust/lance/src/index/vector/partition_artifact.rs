@@ -13,6 +13,7 @@ use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use lance_arrow::FixedSizeListArrayExt;
 use lance_core::cache::LanceCache;
 use lance_core::datatypes::Schema;
+use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{Error, ROW_ID, Result};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::reader::{FileReader, FileReaderOptions};
@@ -692,9 +693,24 @@ impl PartitionArtifactShuffleReader {
             )));
         }
 
+        // Reads here are driven by `build_partitions`' own
+        // `get_num_compute_intensive_cpus()`-wide buffered stream (see
+        // `IvfIndexBuilder::build_partitions`), not by dataset-scan-style
+        // concurrency. Pin this scheduler's I/O capacity (and, since
+        // `max_bandwidth` derives buffer size from the same source, its
+        // buffer size too) to that value instead of the default
+        // (`ObjectStore::io_parallelism()`, i.e. `LANCE_IO_THREADS`): that
+        // env var is tuned for the much larger, single-scheduler dataset
+        // scan, and reusing it here means every one of the many small
+        // per-partition reads gets an oversized queue, adding overhead
+        // without benefit (empirically: raising LANCE_IO_THREADS from 8 to
+        // 32 roughly doubled this stage's take/build time and peak RSS
+        // while helping the dataset scan).
+        let io_capacity = get_num_compute_intensive_cpus();
         let scheduler = ScanScheduler::new(
             object_store.clone(),
-            SchedulerConfig::max_bandwidth(&object_store),
+            SchedulerConfig::new(32 * 1024 * 1024 * io_capacity as u64)
+                .with_io_capacity(io_capacity),
         );
         Ok(Self {
             scheduler,

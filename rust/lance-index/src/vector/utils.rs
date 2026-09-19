@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use arrow::buffer::NullBuffer;
 use arrow::compute::cast;
 use arrow_array::ArrowPrimitiveType;
 use arrow_array::types::{Float16Type, Float32Type, Float64Type};
@@ -11,6 +10,7 @@ use lance_arrow::FixedSizeListArrayExt;
 use lance_core::{Error, Result};
 use lance_io::encodings::plain::bytes_to_array;
 use lance_linalg::distance::DistanceType;
+use num_traits::Float;
 use prost::bytes;
 use std::sync::LazyLock;
 use std::{ops::Range, sync::Arc};
@@ -357,6 +357,7 @@ fn compute_row_parallel(
 mod tests {
     use super::*;
 
+    use arrow::buffer::NullBuffer;
     use arrow_array::{Float16Array, Float32Array, Float64Array, UInt8Array};
     use half::f16;
     use lance_arrow::FixedSizeListArrayExt;

@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use arrow::buffer::NullBuffer;
 use arrow::compute::cast;
+use arrow_array::ArrowPrimitiveType;
 use arrow_array::types::{Float16Type, Float32Type, Float64Type};
 use arrow_array::{Array, ArrayRef, BooleanArray, FixedSizeListArray, cast::AsArray};
 use arrow_schema::{DataType, Field};
@@ -239,34 +241,116 @@ impl TryFrom<&pb::Tensor> for FixedSizeListArray {
     }
 }
 
+const DEFAULT_IS_FINITE_THREADS: usize = 8;
+// Below this row count, threading overhead isn't worth it -- run single-threaded.
+const IS_FINITE_MIN_ROWS_FOR_THREADING: usize = 4096;
+
+fn is_finite_threads_from_env() -> usize {
+    std::env::var("LANCE_IS_FINITE_THREADS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|threads| *threads > 0)
+        .unwrap_or(DEFAULT_IS_FINITE_THREADS)
+}
+
 /// Check if all vectors in the FixedSizeListArray are finite
 /// null values are considered as not finite
 /// returns a BooleanArray
 /// with the same length as the FixedSizeListArray
 /// with true for finite values and false for non-finite values
 pub fn is_finite(fsl: &FixedSizeListArray) -> BooleanArray {
-    let is_finite = fsl
-        .iter()
-        .map(|v| match v {
-            Some(v) => match v.data_type() {
-                DataType::Float16 => {
-                    let v = v.as_primitive::<Float16Type>();
-                    Array::null_count(v) == 0 && v.values().iter().all(|v| v.is_finite())
-                }
-                DataType::Float32 => {
-                    let v = v.as_primitive::<Float32Type>();
-                    Array::null_count(v) == 0 && v.values().iter().all(|v| v.is_finite())
-                }
-                DataType::Float64 => {
-                    let v = v.as_primitive::<Float64Type>();
-                    Array::null_count(v) == 0 && v.values().iter().all(|v| v.is_finite())
-                }
-                _ => Array::null_count(&v) == 0,
-            },
-            None => false,
-        })
-        .collect::<Vec<_>>();
-    BooleanArray::from(is_finite)
+    match fsl.values().data_type() {
+        DataType::Float16 => is_finite_typed::<Float16Type>(fsl),
+        DataType::Float32 => is_finite_typed::<Float32Type>(fsl),
+        DataType::Float64 => is_finite_typed::<Float64Type>(fsl),
+        _ => is_finite_no_float(fsl),
+    }
+}
+
+/// `is_finite` for a float child type: every row must have no nulls (row-level
+/// or within the row's `dim` child values) and every value must be finite.
+fn is_finite_typed<T: ArrowPrimitiveType>(fsl: &FixedSizeListArray) -> BooleanArray
+where
+    T::Native: num_traits::Float,
+{
+    let dim = fsl.value_length() as usize;
+    let values = fsl.values().as_primitive::<T>();
+    let data = values.values();
+    let child_nulls = values.nulls().cloned();
+    let row_nulls = fsl.nulls().cloned();
+
+    compute_row_parallel(fsl.len(), move |row| {
+        if row_nulls.as_ref().is_some_and(|nulls| !nulls.is_valid(row)) {
+            return false;
+        }
+        let start = row * dim;
+        if let Some(nulls) = &child_nulls
+            && (start..start + dim).any(|i| !nulls.is_valid(i))
+        {
+            return false;
+        }
+        data[start..start + dim].iter().all(|v| v.is_finite())
+    })
+}
+
+/// `is_finite` for a non-float child type: finiteness isn't meaningful, so
+/// this only checks for nulls, matching the original per-row
+/// `Array::null_count(&v) == 0` check.
+fn is_finite_no_float(fsl: &FixedSizeListArray) -> BooleanArray {
+    let dim = fsl.value_length() as usize;
+    let child_nulls = fsl.values().nulls().cloned();
+    let row_nulls = fsl.nulls().cloned();
+
+    compute_row_parallel(fsl.len(), move |row| {
+        if row_nulls.as_ref().is_some_and(|nulls| !nulls.is_valid(row)) {
+            return false;
+        }
+        let start = row * dim;
+        child_nulls
+            .as_ref()
+            .is_none_or(|nulls| (start..start + dim).all(|i| nulls.is_valid(i)))
+    })
+}
+
+/// Runs `row_is_ok(row)` for every row in `[0, num_rows)`, in parallel across
+/// `LANCE_IS_FINITE_THREADS` (default 8) threads for large enough inputs,
+/// via disjoint output slices -- no locking needed since each thread only
+/// ever writes its own chunk.
+fn compute_row_parallel(
+    num_rows: usize,
+    row_is_ok: impl Fn(usize) -> bool + Sync,
+) -> BooleanArray {
+    let mut result = vec![false; num_rows];
+    if num_rows == 0 {
+        return BooleanArray::from(result);
+    }
+
+    let num_threads = if num_rows < IS_FINITE_MIN_ROWS_FOR_THREADING {
+        1
+    } else {
+        is_finite_threads_from_env().min(num_rows)
+    };
+
+    if num_threads <= 1 {
+        for (row, out) in result.iter_mut().enumerate() {
+            *out = row_is_ok(row);
+        }
+    } else {
+        let chunk_len = num_rows.div_ceil(num_threads);
+        let row_is_ok = &row_is_ok;
+        std::thread::scope(|scope| {
+            for (chunk_idx, out_chunk) in result.chunks_mut(chunk_len).enumerate() {
+                let start = chunk_idx * chunk_len;
+                scope.spawn(move || {
+                    for (i, out) in out_chunk.iter_mut().enumerate() {
+                        *out = row_is_ok(start + i);
+                    }
+                });
+            }
+        });
+    }
+
+    BooleanArray::from(result)
 }
 
 #[cfg(test)]
@@ -364,5 +448,81 @@ mod tests {
         assert_eq!(tensor.data_type, pb::tensor::DataType::Float64 as i32);
         assert_eq!(tensor.shape, vec![4, 5]);
         assert_eq!(tensor.data.len(), 20 * 8);
+    }
+
+    #[test]
+    fn test_is_finite_f32_basic() {
+        // 3 rows of dim 2: all-finite, contains NaN, contains +inf.
+        let values = Float32Array::from(vec![1.0, 2.0, 3.0, f32::NAN, f32::INFINITY, 4.0]);
+        let fsl = FixedSizeListArray::try_new_from_values(values, 2).unwrap();
+        let result = is_finite(&fsl);
+        assert_eq!(
+            result.values().iter().collect::<Vec<_>>(),
+            vec![true, false, false]
+        );
+    }
+
+    #[test]
+    fn test_is_finite_f16() {
+        let values = Float16Array::from(vec![
+            f16::from_f32(1.0),
+            f16::from_f32(2.0),
+            f16::NAN,
+            f16::from_f32(2.0),
+        ]);
+        let fsl = FixedSizeListArray::try_new_from_values(values, 2).unwrap();
+        let result = is_finite(&fsl);
+        assert_eq!(result.values().iter().collect::<Vec<_>>(), vec![true, false]);
+    }
+
+    #[test]
+    fn test_is_finite_row_null() {
+        let values = Float32Array::from(vec![1.0, 2.0, 3.0, 4.0]);
+        let field = Arc::new(Field::new("item", DataType::Float32, true));
+        let row_nulls = NullBuffer::from(vec![true, false]);
+        let fsl =
+            FixedSizeListArray::try_new(field, 2, Arc::new(values), Some(row_nulls)).unwrap();
+        let result = is_finite(&fsl);
+        // second row is null at the FixedSizeListArray level -- must be false
+        // regardless of the (finite) values it points at.
+        assert_eq!(result.values().iter().collect::<Vec<_>>(), vec![true, false]);
+    }
+
+    #[test]
+    fn test_is_finite_child_null() {
+        // Row 1's second element is null -- row must be false even though
+        // every present value is finite.
+        let values = Float32Array::from(vec![Some(1.0), Some(2.0), Some(3.0), None]);
+        let fsl = FixedSizeListArray::try_new_from_values(values, 2).unwrap();
+        let result = is_finite(&fsl);
+        assert_eq!(result.values().iter().collect::<Vec<_>>(), vec![true, false]);
+    }
+
+    #[test]
+    fn test_is_finite_large_matches_expected_across_chunks() {
+        // Large enough to exercise the multi-threaded path (>
+        // IS_FINITE_MIN_ROWS_FOR_THREADING), with non-finite rows scattered
+        // across the row range so every thread's chunk contains at least one,
+        // to catch chunk-boundary bugs.
+        const NUM_ROWS: usize = 10_000;
+        const DIM: usize = 4;
+        let mut data = vec![0.0f32; NUM_ROWS * DIM];
+        let mut expected = vec![true; NUM_ROWS];
+        for row in (0..NUM_ROWS).step_by(97) {
+            data[row * DIM] = f32::NAN;
+            expected[row] = false;
+        }
+        let fsl =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(data), DIM as i32).unwrap();
+        let result = is_finite(&fsl);
+        assert_eq!(result.values().iter().collect::<Vec<_>>(), expected);
+    }
+
+    #[test]
+    fn test_is_finite_empty() {
+        let values = Float32Array::from(Vec::<f32>::new());
+        let fsl = FixedSizeListArray::try_new_from_values(values, 4).unwrap();
+        let result = is_finite(&fsl);
+        assert_eq!(result.len(), 0);
     }
 }

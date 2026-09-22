@@ -51,7 +51,19 @@ use crate::{
 
 /// Default chunk size for reading large pages (8MiB)
 /// Pages larger than this will be split into multiple chunks during read
-pub const DEFAULT_READ_CHUNK_SIZE: u64 = 8 * 1024 * 1024;
+///
+/// Overridable via `LANCE_READ_CHUNK_SIZE`, mirroring `LANCE_MAX_IOP_SIZE`
+/// in `lance-io`. Note these control two *different* splits: this one
+/// happens in `LanceEncodingsIo::submit_request`, before the request
+/// reaches the scheduler, and every range it splits must be copied back
+/// into a single buffer afterwards. `LANCE_MAX_IOP_SIZE` splits later,
+/// at the physical-IO layer. Raising `LANCE_MAX_IOP_SIZE` therefore does
+/// not eliminate the reassembly copy; only raising this does.
+pub static DEFAULT_READ_CHUNK_SIZE: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+    std::env::var("LANCE_READ_CHUNK_SIZE")
+        .map(|val| val.parse().unwrap())
+        .unwrap_or(8 * 1024 * 1024)
+});
 
 // For now, we don't use global buffers for anything other than schema.  If we
 // use these later we should make them lazily loaded and then cached once loaded.
@@ -399,7 +411,7 @@ impl Default for FileReaderOptions {
     fn default() -> Self {
         Self {
             decoder_config: DecoderConfig::default(),
-            read_chunk_size: DEFAULT_READ_CHUNK_SIZE,
+            read_chunk_size: *DEFAULT_READ_CHUNK_SIZE,
             batch_size_bytes: None,
         }
     }

@@ -18,7 +18,7 @@ impl LanceEncodingsIo {
     pub fn new(scheduler: FileScheduler) -> Self {
         Self {
             scheduler,
-            read_chunk_size: DEFAULT_READ_CHUNK_SIZE,
+            read_chunk_size: *DEFAULT_READ_CHUNK_SIZE,
         }
     }
 

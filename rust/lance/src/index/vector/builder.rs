@@ -94,6 +94,12 @@ use super::{
 // the number of partitions to evaluate for reassigning
 const REASSIGN_RANGE: usize = 64;
 
+/// Prints the wall time of one `IvfIndexBuilder::build` phase (the same
+/// stages reported to `IndexBuildProgress`).
+fn log_build_stage_time(stage: &str, start: Instant) {
+    eprintln!("phase {stage} (lance): {:.3}s", start.elapsed().as_secs_f64());
+}
+
 // Builder for IVF index
 // The builder will train the IVF model and quantizer, shuffle the dataset, and build the sub index
 // for each partition.
@@ -276,18 +282,24 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         progress
             .stage_start("train_ivf", max_iters, "iterations")
             .await?;
+        let stage_start = Instant::now();
         self.with_ivf(self.load_or_build_ivf().boxed().await?);
+        log_build_stage_time("train_ivf", stage_start);
         progress.stage_complete("train_ivf").await?;
 
         progress.stage_start("train_quantizer", None, "").await?;
+        let stage_start = Instant::now();
         self.with_quantizer(self.load_or_build_quantizer().await?);
+        log_build_stage_time("train_quantizer", stage_start);
         progress.stage_complete("train_quantizer").await?;
 
         // step 2. shuffle the dataset
         if self.shuffle_reader.is_none() {
             let num_rows = self.num_rows_to_shuffle().await?;
             progress.stage_start("shuffle", num_rows, "rows").await?;
+            let stage_start = Instant::now();
             self.shuffle_dataset().boxed().await?;
+            log_build_stage_time("shuffle", stage_start);
             progress.stage_complete("shuffle").await?;
         }
 
@@ -296,8 +308,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         progress
             .stage_start("merge_partitions", num_partitions, "partitions")
             .await?;
+        let stage_start = Instant::now();
         let build_idx_stream = self.build_partitions().boxed().await?;
         self.merge_partitions(build_idx_stream).await?;
+        log_build_stage_time("merge_partitions", stage_start);
         progress.stage_complete("merge_partitions").await?;
 
         Ok(self.merged_num)

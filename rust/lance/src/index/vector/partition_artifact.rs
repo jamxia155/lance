@@ -692,9 +692,22 @@ impl PartitionArtifactShuffleReader {
             )));
         }
 
+        // Use the object store's own I/O parallelism default here (e.g. 8 for
+        // local disk) instead of `ObjectStore::io_parallelism()`/
+        // `LANCE_IO_THREADS`: that env var is tuned for the much larger,
+        // single-scheduler dataset scan, and reusing it here means every one
+        // of the many small per-partition reads gets an oversized queue,
+        // adding overhead without benefit (empirically: raising
+        // LANCE_IO_THREADS from 8 to 32 roughly doubled this stage's take/
+        // build time and peak RSS while helping the dataset scan). This is
+        // deliberately the store's pre-existing default, not a value we
+        // invented -- it's what this stage always used before `LANCE_IO_
+        // THREADS` started leaking into it.
+        let io_capacity = object_store.default_io_parallelism();
         let scheduler = ScanScheduler::new(
             object_store.clone(),
-            SchedulerConfig::max_bandwidth(&object_store),
+            SchedulerConfig::new(32 * 1024 * 1024 * io_capacity as u64)
+                .with_io_capacity(io_capacity),
         );
         Ok(Self {
             scheduler,

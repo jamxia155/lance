@@ -818,6 +818,18 @@ impl ObjectStore {
             .max(1)
     }
 
+    /// This store's own I/O parallelism default, ignoring `LANCE_IO_THREADS`.
+    ///
+    /// Use this instead of [`Self::io_parallelism`] when a caller wants a
+    /// sensible, store-type-appropriate concurrency (e.g. lower for local
+    /// disks, higher for cloud/network stores) without inheriting whatever a
+    /// user has tuned `LANCE_IO_THREADS` to for an unrelated, larger scan --
+    /// see `PartitionArtifactShuffleReader::open_file_reader`.
+    /// Like [`Self::io_parallelism`], always at least 1.
+    pub fn default_io_parallelism(&self) -> usize {
+        self.io_parallelism.max(1)
+    }
+
     /// Get the IO tracker for this object store
     ///
     /// The IO tracker can be used to get statistics about read/write operations

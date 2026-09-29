@@ -845,6 +845,19 @@ pub struct SchedulerConfig {
     /// - `Some(false)` forces the standard scheduler.
     /// - `None` defers to the object store's preference (see [`ObjectStore::prefers_lite_scheduler`]).
     pub use_lite_scheduler: Option<bool>,
+    /// Overrides the scheduler's concurrent I/O request capacity.
+    ///
+    /// - `Some(n)` uses `n` directly.
+    /// - `None` (the default) derives it from `ObjectStore::io_parallelism()`, i.e.
+    ///   `LANCE_IO_THREADS` if set.
+    ///
+    /// Most callers want the default so a single env var tunes I/O concurrency
+    /// everywhere. Set this explicitly when a caller's own concurrency is
+    /// already bounded by something else (e.g. a CPU-bound worker pool) and
+    /// scaling this scheduler's capacity with an unrelated, dataset-scan-tuned
+    /// env var would just add overhead (larger per-scheduler queues) without
+    /// benefit -- see `PartitionArtifactShuffleReader::open_file_reader`.
+    pub io_capacity: Option<usize>,
 }
 
 impl SchedulerConfig {
@@ -854,6 +867,7 @@ impl SchedulerConfig {
             use_lite_scheduler: std::env::var("LANCE_USE_LITE_SCHEDULER")
                 .ok()
                 .map(|v| str_is_truthy(v.trim())),
+            io_capacity: None,
         }
     }
 
@@ -862,6 +876,7 @@ impl SchedulerConfig {
         Self {
             io_buffer_size_bytes: 256 * 1024 * 1024,
             use_lite_scheduler: None,
+            io_capacity: None,
         }
     }
 
@@ -869,6 +884,15 @@ impl SchedulerConfig {
     /// at all).  We assume a max page size of 32MiB and then allow 32MiB per I/O thread
     pub fn max_bandwidth(store: &ObjectStore) -> Self {
         Self::new(32 * 1024 * 1024 * store.io_parallelism() as u64)
+    }
+
+    /// Returns a copy of this config with an explicit I/O capacity, overriding
+    /// the object store's `io_parallelism()` (see [`Self::io_capacity`]).
+    pub fn with_io_capacity(self, io_capacity: usize) -> Self {
+        Self {
+            io_capacity: Some(io_capacity),
+            ..self
+        }
     }
 
     pub fn with_lite_scheduler(self) -> Self {
@@ -887,7 +911,9 @@ impl ScanScheduler {
     /// * object_store - the store to wrap
     /// * config - configuration settings for the scheduler
     pub fn new(object_store: Arc<ObjectStore>, config: SchedulerConfig) -> Arc<Self> {
-        let io_capacity = object_store.io_parallelism();
+        let io_capacity = config
+            .io_capacity
+            .unwrap_or_else(|| object_store.io_parallelism());
         let stats = IoStats::new();
         let use_lite = config
             .use_lite_scheduler
@@ -1839,6 +1865,7 @@ mod tests {
         let config = SchedulerConfig {
             io_buffer_size_bytes: 1024 * 1024,
             use_lite_scheduler: None,
+            io_capacity: None,
         };
 
         let scan_scheduler = ScanScheduler::new(obj_store, config);
@@ -1930,6 +1957,7 @@ mod tests {
             SchedulerConfig {
                 io_buffer_size_bytes: 1024 * 1024,
                 use_lite_scheduler: Some(false),
+                io_capacity: None,
             },
         );
         let file_scheduler = scheduler
@@ -2060,6 +2088,7 @@ mod tests {
         let config = SchedulerConfig {
             io_buffer_size_bytes: 10,
             use_lite_scheduler: None,
+            io_capacity: None,
         };
 
         let scan_scheduler = ScanScheduler::new(obj_store.clone(), config);
@@ -2135,6 +2164,7 @@ mod tests {
         let config = SchedulerConfig {
             io_buffer_size_bytes: 10,
             use_lite_scheduler: None,
+            io_capacity: None,
         };
 
         let scan_scheduler = ScanScheduler::new(obj_store, config);
@@ -2217,6 +2247,7 @@ mod tests {
             SchedulerConfig {
                 io_buffer_size_bytes: 10,
                 use_lite_scheduler: Some(false),
+                io_capacity: None,
             },
         );
         let semaphore = Arc::new(tokio::sync::Semaphore::new(0));
@@ -2326,6 +2357,7 @@ mod tests {
         let config = SchedulerConfig {
             io_buffer_size_bytes: 256 * 1024 * 1024,
             use_lite_scheduler: None,
+            io_capacity: None,
         };
         let scheduler = ScanScheduler::new(memory_store.clone(), config);
         assert!(!scheduler.uses_lite_scheduler());
@@ -2346,6 +2378,7 @@ mod tests {
         let config = SchedulerConfig {
             io_buffer_size_bytes: 256 * 1024 * 1024,
             use_lite_scheduler: None,
+            io_capacity: None,
         };
         let scheduler = ScanScheduler::new(uring_store.clone(), config);
         assert!(scheduler.uses_lite_scheduler());
@@ -2354,6 +2387,7 @@ mod tests {
         let config = SchedulerConfig {
             io_buffer_size_bytes: 256 * 1024 * 1024,
             use_lite_scheduler: Some(false),
+            io_capacity: None,
         };
         let scheduler = ScanScheduler::new(uring_store, config);
         assert!(!scheduler.uses_lite_scheduler());
@@ -2362,6 +2396,7 @@ mod tests {
         let config = SchedulerConfig {
             io_buffer_size_bytes: 256 * 1024 * 1024,
             use_lite_scheduler: Some(true),
+            io_capacity: None,
         };
         let scheduler = ScanScheduler::new(memory_store, config);
         assert!(scheduler.uses_lite_scheduler());
@@ -2383,6 +2418,7 @@ mod tests {
         let config = SchedulerConfig {
             io_buffer_size_bytes: 1,
             use_lite_scheduler: None,
+            io_capacity: None,
         };
         let scan_scheduler = ScanScheduler::new(obj_store.clone(), config);
         let file_scheduler = scan_scheduler
@@ -2408,6 +2444,7 @@ mod tests {
         let config = SchedulerConfig {
             io_buffer_size_bytes: 0,
             use_lite_scheduler: Some(false),
+            io_capacity: None,
         };
         let scheduler = ScanScheduler::new(obj_store, config);
 
@@ -2484,6 +2521,7 @@ mod tests {
         let config = SchedulerConfig {
             io_buffer_size_bytes: 10,
             use_lite_scheduler: Some(false),
+            io_capacity: None,
         };
         let scan_scheduler = ScanScheduler::new(obj_store, config);
         let file_scheduler = scan_scheduler
@@ -2552,6 +2590,7 @@ mod tests {
             SchedulerConfig {
                 io_buffer_size_bytes: 100,
                 use_lite_scheduler: Some(use_lite_scheduler),
+                io_capacity: None,
             },
         );
 

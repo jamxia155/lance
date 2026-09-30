@@ -11,8 +11,8 @@ use std::future::Future;
 use std::num::NonZero;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
 use lance_core::utils::parse::str_is_truthy;
@@ -80,7 +80,31 @@ impl PrioritiesInFlight {
     }
 }
 
+// SCRATCH INSTRUMENTATION (LANCE_IOQ_TRACE=1): periodic snapshots of the I/O
+// queue's admission state, to find what limits reads in flight.
+static IOQ_TRACE: LazyLock<bool> =
+    LazyLock::new(|| std::env::var("LANCE_IOQ_TRACE").is_ok_and(|v| v == "1"));
+static IOQ_NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Default)]
+struct IoqTrace {
+    admit_by_priority: u64,
+    admit_by_bytes: u64,
+    refuse_no_iops: u64,
+    refuse_bytes: u64,
+    completed: u64,
+    consumed_bytes: u64,
+    max_pending: usize,
+    max_inflight: u32,
+}
+
 struct IoQueueState {
+    // SCRATCH INSTRUMENTATION
+    trace_id: u64,
+    trace_capacity: u32,
+    trace_budget: i64,
+    trace_last: Instant,
+    trace: IoqTrace,
     // Number of IOPS we can issue concurrently before pausing I/O
     iops_avail: u32,
     // Number of bytes we are allowed to buffer in memory before pausing I/O
@@ -103,6 +127,11 @@ struct IoQueueState {
 impl IoQueueState {
     fn new(io_capacity: u32, io_buffer_size: u64) -> Self {
         Self {
+            trace_id: IOQ_NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            trace_capacity: io_capacity,
+            trace_budget: io_buffer_size as i64,
+            trace_last: Instant::now(),
+            trace: IoqTrace::default(),
             iops_avail: io_capacity,
             bytes_avail: io_buffer_size as i64,
             pending_requests: BinaryHeap::new(),
@@ -144,8 +173,68 @@ impl IoQueueState {
         }
     }
 
+    // SCRATCH INSTRUMENTATION: one line per ~100 ms while the queue is active.
+    fn trace_maybe_report(&mut self) {
+        if !*IOQ_TRACE {
+            return;
+        }
+        let inflight = self.trace_capacity - self.iops_avail;
+        self.trace.max_pending = self.trace.max_pending.max(self.pending_requests.len());
+        self.trace.max_inflight = self.trace.max_inflight.max(inflight);
+        if self.trace_last.elapsed() < Duration::from_millis(100) {
+            return;
+        }
+        self.trace_last = Instant::now();
+        let prio = |p: u128| format!("{}:{}", p >> 64, p & 0xFFFF_FFFF_FFFF_FFFF);
+        let head = self
+            .pending_requests
+            .peek()
+            .map(|t| format!("{}/{}B", prio(t.priority), t.num_bytes()))
+            .unwrap_or_else(|| "-".to_string());
+        let min_in_flight = match self.priorities_in_flight.in_flight.first() {
+            Some(p) => prio(*p),
+            None => "-".to_string(),
+        };
+        let t = &self.trace;
+        let gib = |b: i64| b as f64 / (1u64 << 30) as f64;
+        eprintln!(
+            "IOQ[{}] t={:.3} pending={} (max {}) inflight={}/{} (max {}) held_gib={:.2}/{:.2} prios_in_flight={} min_in_flight={} head={} | admit_prio={} admit_bytes={} refuse_iops={} refuse_bytes={} completed={} consumed_gib={:.2}",
+            self.trace_id,
+            self.start.elapsed().as_secs_f64(),
+            self.pending_requests.len(),
+            t.max_pending,
+            inflight,
+            self.trace_capacity,
+            t.max_inflight,
+            gib(self.trace_budget - self.bytes_avail),
+            gib(self.trace_budget),
+            self.priorities_in_flight.in_flight.len(),
+            min_in_flight,
+            head,
+            t.admit_by_priority,
+            t.admit_by_bytes,
+            t.refuse_no_iops,
+            t.refuse_bytes,
+            t.completed,
+            gib(t.consumed_bytes as i64),
+        );
+        self.trace = IoqTrace::default();
+    }
+
     fn next_task(&mut self) -> Option<IoTask> {
+        self.trace_maybe_report();
         let task = self.pending_requests.peek()?;
+        if *IOQ_TRACE {
+            if self.iops_avail == 0 {
+                self.trace.refuse_no_iops += 1;
+            } else if task.priority <= self.priorities_in_flight.min_in_flight() {
+                self.trace.admit_by_priority += 1;
+            } else if task.num_bytes() as i64 > self.bytes_avail {
+                self.trace.refuse_bytes += 1;
+            } else {
+                self.trace.admit_by_bytes += 1;
+            }
+        }
         if self.can_deliver(task) {
             self.priorities_in_flight.push(task.priority);
             self.iops_avail -= 1;
@@ -216,6 +305,8 @@ impl IoQueue {
 
     fn on_iop_complete(&self) {
         let mut state = self.state.lock().unwrap();
+        state.trace.completed += 1;
+        state.trace_maybe_report();
         state.iops_avail += 1;
         drop(state);
 
@@ -224,6 +315,8 @@ impl IoQueue {
 
     fn on_bytes_consumed(&self, bytes: u64, priority: u128, num_reqs: usize) {
         let mut state = self.state.lock().unwrap();
+        state.trace.consumed_bytes += bytes;
+        state.trace_maybe_report();
         state.bytes_avail += bytes as i64;
         for _ in 0..num_reqs {
             state.priorities_in_flight.remove(priority);

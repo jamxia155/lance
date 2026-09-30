@@ -61,6 +61,17 @@ impl EncodingsIo for LanceEncodingsIo {
         // reassemble our results, inserting empties and merging parts
         let mut needs_reassembly = false;
 
+        // A direct-I/O read is returned as one zero-copy buffer, so splitting
+        // it below the store's IOP size gains nothing and costs a copy to
+        // reassemble the chunks below. That copy runs on the async task that
+        // awaits the read, and can delay the scheduler's I/O loop enough to
+        // leave most I/O capacity idle.
+        let read_chunk_size = if self.scheduler.is_direct_io() {
+            self.read_chunk_size.max(self.scheduler.max_iop_size())
+        } else {
+            self.read_chunk_size
+        };
+
         // Split large ranges into smaller chunks
         //
         // TODO: consider read_chunk_size before submitting requests.
@@ -74,9 +85,9 @@ impl EncodingsIo for LanceEncodingsIo {
             }
             let range_size = range.end - range.start;
 
-            if range_size > self.read_chunk_size {
+            if range_size > read_chunk_size {
                 needs_reassembly = true;
-                let num_chunks = range_size.div_ceil(self.read_chunk_size);
+                let num_chunks = range_size.div_ceil(read_chunk_size);
                 let chunk_size = range_size / num_chunks;
 
                 for i in 0..num_chunks {
@@ -144,5 +155,44 @@ impl EncodingsIo for LanceEncodingsIo {
             Ok(reassembled)
         }
         .boxed()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lance_core::utils::tempfile::TempStdDir;
+    use lance_io::object_store::ObjectStore;
+    use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+    use lance_io::utils::CachedFileSize;
+    use rstest::rstest;
+
+    // A 32 MiB read (a Lance 2.0 page) is split into 8 MiB chunks, then 16 MiB
+    // IOPs, on a buffered store, and read as one IOP on a direct-I/O store.
+    #[rstest]
+    #[case::buffered("file", 2)]
+    #[cfg_attr(target_os = "linux", case::direct_io("file+direct", 1))]
+    #[tokio::test]
+    async fn test_large_read_iops(#[case] scheme: &str, #[case] expected_iops: u64) {
+        const PAGE: usize = 32 * 1024 * 1024;
+        let dir = TempStdDir::default();
+        let file_path = dir.join("data.bin");
+        let data: Vec<u8> = (0..PAGE + 4096).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&file_path, &data).unwrap();
+
+        let uri = format!("{scheme}://{}", file_path.display());
+        let (store, path) = ObjectStore::from_uri(&uri).await.unwrap();
+        let scheduler = ScanScheduler::new(store, SchedulerConfig::default_for_testing());
+        let file_scheduler = scheduler
+            .open_file(&path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let io = LanceEncodingsIo::new(file_scheduler);
+
+        let range = 100..(100 + PAGE as u64);
+        let bytes = io.submit_request(vec![range.clone()], 0).await.unwrap();
+        assert_eq!(bytes.len(), 1);
+        assert_eq!(bytes[0].as_ref(), &data[range.start as usize..range.end as usize]);
+        assert_eq!(scheduler.stats().iops, expected_iops);
     }
 }

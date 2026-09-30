@@ -6,8 +6,8 @@ use std::{collections::HashMap, sync::Arc};
 #[cfg(any(windows, test))]
 use crate::object_store::LocalDirOperations;
 use crate::object_store::{
-    DEFAULT_LOCAL_BLOCK_SIZE, DEFAULT_LOCAL_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
-    ObjectStoreParams, ObjectStoreProvider, StorageOptions,
+    DEFAULT_LOCAL_BLOCK_SIZE, DEFAULT_LOCAL_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE,
+    DIRECT_IO_MIN_IOP_SIZE, ObjectStore, ObjectStoreParams, ObjectStoreProvider, StorageOptions,
 };
 use lance_core::Error;
 use lance_core::error::Result;
@@ -124,13 +124,18 @@ impl ObjectStoreProvider for FileStoreProvider {
         let inner = LocalFileSystem::new();
         #[cfg(not(windows))]
         let local_dir_operations = None;
+        let max_iop_size = if base_path.scheme() == "file+direct" {
+            (*DEFAULT_MAX_IOP_SIZE).max(DIRECT_IO_MIN_IOP_SIZE)
+        } else {
+            *DEFAULT_MAX_IOP_SIZE
+        };
 
         Ok(ObjectStore {
             inner: Arc::new(inner),
             local_dir_operations,
             scheme: base_path.scheme().to_owned(),
             block_size,
-            max_iop_size: *DEFAULT_MAX_IOP_SIZE,
+            max_iop_size,
             use_constant_size_upload_parts: false,
             list_is_lexically_ordered: false,
             io_parallelism: DEFAULT_LOCAL_IO_PARALLELISM,

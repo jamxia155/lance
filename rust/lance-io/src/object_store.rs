@@ -99,6 +99,11 @@ const DEFAULT_LOCAL_BLOCK_SIZE: usize = 4 * 1024; // 4KB block size
 ))]
 const DEFAULT_CLOUD_BLOCK_SIZE: usize = 64 * 1024; // 64KB block size
 
+/// Minimum IOP size for `file+direct://` stores: large enough that a whole
+/// data page (32 MiB for Lance file format 2.0 datasets written with default
+/// settings) is read as a single zero-copy read.
+pub const DIRECT_IO_MIN_IOP_SIZE: u64 = 64 * 1024 * 1024;
+
 pub static DEFAULT_MAX_IOP_SIZE: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
     std::env::var("LANCE_MAX_IOP_SIZE")
         .map(|val| val.parse().unwrap())
@@ -785,6 +790,13 @@ impl ObjectStore {
             return false;
         }
         true
+    }
+
+    /// Whether reads from this store use direct I/O (`file+direct://`): each
+    /// read is one `O_DIRECT` read returned as a zero-copy buffer, so
+    /// splitting a request into smaller reads only adds a reassembly copy.
+    pub fn is_direct_io(&self) -> bool {
+        self.scheme == "file+direct"
     }
 
     /// Whether this object store prefers the lite scheduler.

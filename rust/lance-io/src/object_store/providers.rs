@@ -100,6 +100,8 @@ pub struct ObjectStoreRegistryStats {
 /// - `file-object-store`: A local file object store that uses the ObjectStore API,
 ///   for all operations. Used for testing with ObjectStore wrappers.
 /// - `file+uring`: A local file object store using io_uring (Linux only).
+/// - `file+direct`: A local file object store that reads with `O_DIRECT`,
+///   bypassing the page cache (Linux only).
 /// - `s3`: An S3 object store.
 /// - `s3+ddb`: An S3 object store with DynamoDB for metadata.
 /// - `az`: An Azure Blob Storage object store.
@@ -378,6 +380,8 @@ impl Default for ObjectStoreRegistry {
         );
         #[cfg(target_os = "linux")]
         providers.insert("file+uring".into(), Arc::new(local::FileStoreProvider));
+        #[cfg(target_os = "linux")]
+        providers.insert("file+direct".into(), Arc::new(local::FileStoreProvider));
 
         #[cfg(feature = "aws")]
         {

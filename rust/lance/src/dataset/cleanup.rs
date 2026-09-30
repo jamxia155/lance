@@ -802,7 +802,7 @@ impl<'a> CleanupTask<'a> {
         let deletes_files = self.action.deletes_files();
         let removes_empty_dirs = matches!(
             self.dataset.object_store.scheme(),
-            "file" | "file+uring" | "file-object-store"
+            "file" | "file+uring" | "file+direct" | "file-object-store"
         );
         let indices_dir = self.dataset.indices_dir();
         let retained_index_dirs = inspection

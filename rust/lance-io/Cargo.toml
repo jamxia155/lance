@@ -50,6 +50,7 @@ reqsign-file-read-tokio = { version = "3.0.3", optional = true }
 reqsign-google = { version = "3.0.3", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }
 io-uring = { workspace = true }
 
 [dev-dependencies]

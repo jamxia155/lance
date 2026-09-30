@@ -41,6 +41,8 @@ use url::Url;
 
 use super::local::LocalObjectReader;
 #[cfg(target_os = "linux")]
+use crate::direct::DirectObjectReader;
+#[cfg(target_os = "linux")]
 use crate::uring::{UringCurrentThreadReader, UringReader};
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
 pub(crate) mod dynamic_credentials;
@@ -767,7 +769,7 @@ impl ObjectStore {
 
     /// Returns true if the object store pointed to a local file system.
     pub fn is_local(&self) -> bool {
-        self.scheme == "file" || self.scheme == "file+uring"
+        self.scheme == "file" || self.scheme == "file+uring" || self.scheme == "file+direct"
     }
 
     /// Returns true when object paths directly encode absolute local filesystem paths.
@@ -884,6 +886,16 @@ impl ObjectStore {
                 .await
             }
             #[cfg(target_os = "linux")]
+            "file+direct" => {
+                DirectObjectReader::open_with_tracker(
+                    path,
+                    self.block_size,
+                    None,
+                    Arc::new(self.io_tracker.clone()),
+                )
+                .await
+            }
+            #[cfg(target_os = "linux")]
             "file+uring" => {
                 // Check if current-thread mode enabled
                 let use_current_thread = std::env::var("LANCE_URING_CURRENT_THREAD")
@@ -941,6 +953,16 @@ impl ObjectStore {
         match self.scheme.as_str() {
             "file" if self.has_direct_local_paths() => {
                 LocalObjectReader::open_with_tracker(
+                    path,
+                    self.block_size,
+                    Some(known_size),
+                    Arc::new(self.io_tracker.clone()),
+                )
+                .await
+            }
+            #[cfg(target_os = "linux")]
+            "file+direct" => {
+                DirectObjectReader::open_with_tracker(
                     path,
                     self.block_size,
                     Some(known_size),

@@ -971,6 +971,17 @@ impl FileScheduler {
     pub fn reader(&self) -> &Arc<dyn Reader> {
         &self.reader
     }
+
+    /// Largest single read this scheduler issues; larger requests are split.
+    pub fn max_iop_size(&self) -> u64 {
+        self.max_iop_size
+    }
+
+    /// Whether the underlying store reads with direct I/O. See
+    /// [`ObjectStore::is_direct_io`].
+    pub fn is_direct_io(&self) -> bool {
+        self.root.object_store.is_direct_io()
+    }
 }
 
 #[cfg(test)]

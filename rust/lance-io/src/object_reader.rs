@@ -5,19 +5,21 @@ use std::fs::File;
 use std::ops::Range;
 use std::sync::Arc;
 
+use crate::local::join_local_io;
 #[cfg(windows)]
 use crate::local::read_exact_at;
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 
 use bytes::Bytes;
-use deepsize::DeepSizeOf;
 use futures::{
     FutureExt,
     future::{BoxFuture, Shared},
     stream::{self, StreamExt},
 };
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result, error::CloneableError};
+use object_store::ObjectStoreExt;
 use object_store::{GetOptions, GetResult, ObjectStore, Result as OSResult, path::Path};
 use tokio::sync::OnceCell;
 use tracing::instrument;
@@ -69,11 +71,12 @@ pub struct CloudObjectReader {
     size: OnceCell<usize>,
 
     block_size: usize,
+    io_parallelism: usize,
     download_retry_count: usize,
 }
 
 impl DeepSizeOf for CloudObjectReader {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         // Skipping object_store because there is no easy way to do that and it shouldn't be too big
         self.path.as_ref().deep_size_of_children(context)
     }
@@ -93,8 +96,20 @@ impl CloudObjectReader {
             path,
             size: OnceCell::new_with(known_size),
             block_size,
+            io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
             download_retry_count,
         })
+    }
+
+    /// Override the I/O parallelism this reader advertises.
+    ///
+    /// `ObjectStore::open` / `open_with_size` pass their normalized effective
+    /// parallelism (`LANCE_IO_THREADS` override applied, at least 1) so
+    /// consumers that size concurrency windows off the reader honor the
+    /// configured request limit instead of the hardcoded cloud default.
+    pub fn with_io_parallelism(mut self, io_parallelism: usize) -> Self {
+        self.io_parallelism = io_parallelism;
+        self
     }
 }
 
@@ -168,7 +183,7 @@ impl Reader for CloudObjectReader {
     }
 
     fn io_parallelism(&self) -> usize {
-        DEFAULT_CLOUD_IO_PARALLELISM
+        self.io_parallelism
     }
 
     /// Object/File Size.
@@ -176,7 +191,8 @@ impl Reader for CloudObjectReader {
         Box::pin(async move {
             self.size
                 .get_or_try_init(|| async move {
-                    let meta = do_with_retry(|| self.object_store.head(&self.path)).await?;
+                    let meta =
+                        do_with_retry(|| Box::pin(self.object_store.head(&self.path))).await?;
                     Ok(meta.size as usize)
                 })
                 .await
@@ -186,25 +202,15 @@ impl Reader for CloudObjectReader {
 
     #[instrument(level = "debug", skip(self))]
     fn get_range(&self, range: Range<usize>) -> BoxFuture<'static, OSResult<Bytes>> {
-        let get_request = Arc::new(GetRequest {
-            object_store: self.object_store.clone(),
-            path: self.path.clone(),
-            options: GetOptions {
-                range: Some(
-                    Range {
-                        start: range.start as u64,
-                        end: range.end as u64,
-                    }
-                    .into(),
-                ),
-                ..Default::default()
-            },
-        });
-        Box::pin(do_get_with_outer_retry(
-            self.download_retry_count,
-            get_request,
-            move || format!("range {:?}", range),
-        ))
+        let object_store = self.object_store.clone();
+        let path = self.path.clone();
+        let range = Range {
+            start: range.start as u64,
+            end: range.end as u64,
+        };
+        Box::pin(async move {
+            do_with_retry(|| Box::pin(object_store.get_range(&path, range.clone()))).await
+        })
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -413,7 +419,9 @@ pub(crate) fn stream_local_range(
             let next = (start + chunk_size).min(end);
             let file_clone = file.clone();
             let path_clone = path.clone();
-            let bytes = tokio::task::spawn_blocking(move || {
+            let num_bytes = (next - start) as u64;
+            let metrics = io_tracker.begin_io("get");
+            let result = join_local_io(tokio::task::spawn_blocking(move || {
                 let mut buf = bytes::BytesMut::with_capacity(next - start);
                 // Safety: buffer capacity matches the exact number of bytes we read below.
                 unsafe { buf.set_len(next - start) };
@@ -422,17 +430,15 @@ pub(crate) fn stream_local_range(
                 #[cfg(windows)]
                 read_exact_at(file_clone, buf.as_mut(), start as u64)?;
                 Ok::<_, std::io::Error>(buf.freeze())
-            })
-            .await?
-            .map_err(|err: std::io::Error| object_store::Error::Generic {
-                store: "LocalFileSystem",
-                source: err.into(),
-            })?;
+            }))
+            .await;
+            metrics.record(&result, num_bytes);
+            let bytes = result?;
 
             io_tracker.record_read(
                 "get_range_stream",
                 path_clone,
-                (next - start) as u64,
+                num_bytes,
                 Some(start as u64..next as u64),
             );
 
@@ -443,7 +449,7 @@ pub(crate) fn stream_local_range(
 }
 
 impl DeepSizeOf for SmallReader {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         let mut size = self.inner.path.as_ref().deep_size_of_children(context);
 
         if let Ok(guard) = self.inner.state.try_lock()

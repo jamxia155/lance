@@ -14,10 +14,10 @@ use crate::traits::Reader;
 use crate::uring::DEFAULT_URING_QUEUE_DEPTH;
 use crate::utils::tracking_store::IOTracker;
 use bytes::{Bytes, BytesMut};
-use deepsize::DeepSizeOf;
+use futures::FutureExt;
 use futures::future::BoxFuture;
-use futures::{FutureExt, TryFutureExt};
 use io_uring::{IoUring, opcode, types};
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 use object_store::path::Path;
 
@@ -258,7 +258,7 @@ pub struct UringCurrentThreadReader {
 }
 
 impl DeepSizeOf for UringCurrentThreadReader {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         // Skip file handle (just a system resource)
         // Only count the path's deep size
         self.handle.path.as_ref().deep_size_of_children(context)
@@ -396,10 +396,14 @@ impl Reader for UringCurrentThreadReader {
         let num_bytes = range.len() as u64;
         let range_u64 = (range.start as u64)..(range.end as u64);
 
+        let metrics = self.io_tracker.begin_io("get");
         self.submit_read(range.start as u64, range.len())
-            .map_ok(move |bytes| {
-                io_tracker.record_read("get_range", path, num_bytes, Some(range_u64));
-                bytes
+            .map(move |result| {
+                metrics.record(&result, num_bytes);
+                if result.is_ok() {
+                    io_tracker.record_read("get_range", path, num_bytes, Some(range_u64));
+                }
+                result
             })
             .boxed()
     }
@@ -411,10 +415,15 @@ impl Reader for UringCurrentThreadReader {
         let io_tracker = self.io_tracker.clone();
         let path = self.handle.path.clone();
 
+        let metrics = self.io_tracker.begin_io("get");
         self.submit_read(0, size)
-            .map_ok(move |bytes| {
-                io_tracker.record_read("get_all", path, bytes.len() as u64, None);
-                bytes
+            .map(move |result| {
+                let num_bytes = result.as_ref().map_or(0, |bytes| bytes.len() as u64);
+                metrics.record(&result, num_bytes);
+                if result.is_ok() {
+                    io_tracker.record_read("get_all", path, num_bytes, None);
+                }
+                result
             })
             .boxed()
     }

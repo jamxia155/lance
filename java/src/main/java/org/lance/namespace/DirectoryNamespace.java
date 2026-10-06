@@ -26,6 +26,9 @@ import org.lance.namespace.model.AnalyzeTableQueryPlanRequest;
 import org.lance.namespace.model.BatchDeleteTableVersionsRequest;
 import org.lance.namespace.model.BatchDeleteTableVersionsResponse;
 import org.lance.namespace.model.CountTableRowsRequest;
+import org.lance.namespace.model.CountTableRowsResponse;
+import org.lance.namespace.model.CreateMaterializedViewRequest;
+import org.lance.namespace.model.CreateMaterializedViewResponse;
 import org.lance.namespace.model.CreateNamespaceRequest;
 import org.lance.namespace.model.CreateNamespaceResponse;
 import org.lance.namespace.model.CreateTableIndexRequest;
@@ -81,7 +84,9 @@ import org.lance.namespace.model.ListTablesResponse;
 import org.lance.namespace.model.MergeInsertIntoTableRequest;
 import org.lance.namespace.model.MergeInsertIntoTableResponse;
 import org.lance.namespace.model.NamespaceExistsRequest;
+import org.lance.namespace.model.NamespaceExistsResponse;
 import org.lance.namespace.model.QueryTableRequest;
+import org.lance.namespace.model.QueryTableResponse;
 import org.lance.namespace.model.RegisterTableRequest;
 import org.lance.namespace.model.RegisterTableResponse;
 import org.lance.namespace.model.RenameTableRequest;
@@ -89,6 +94,7 @@ import org.lance.namespace.model.RenameTableResponse;
 import org.lance.namespace.model.RestoreTableRequest;
 import org.lance.namespace.model.RestoreTableResponse;
 import org.lance.namespace.model.TableExistsRequest;
+import org.lance.namespace.model.TableExistsResponse;
 import org.lance.namespace.model.UpdateTableRequest;
 import org.lance.namespace.model.UpdateTableResponse;
 import org.lance.namespace.model.UpdateTableSchemaMetadataRequest;
@@ -99,6 +105,7 @@ import org.lance.namespace.model.UpdateTableTagResponse;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import org.apache.arrow.memory.BufferAllocator;
 
 import java.io.Closeable;
@@ -237,6 +244,7 @@ public class DirectoryNamespace implements LanceNamespace, Closeable {
 
   private static ObjectMapper createObjectMapper() {
     ObjectMapper mapper = new ObjectMapper();
+    mapper.registerModule(new JavaTimeModule());
     mapper.configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
     return mapper;
   }
@@ -327,10 +335,11 @@ public class DirectoryNamespace implements LanceNamespace, Closeable {
   }
 
   @Override
-  public void namespaceExists(NamespaceExistsRequest request) {
+  public NamespaceExistsResponse namespaceExists(NamespaceExistsRequest request) {
     ensureInitialized();
     String requestJson = toJson(request);
     namespaceExistsNative(nativeDirectoryNamespaceHandle, requestJson);
+    return new NamespaceExistsResponse();
   }
 
   @Override
@@ -358,10 +367,11 @@ public class DirectoryNamespace implements LanceNamespace, Closeable {
   }
 
   @Override
-  public void tableExists(TableExistsRequest request) {
+  public TableExistsResponse tableExists(TableExistsRequest request) {
     ensureInitialized();
     String requestJson = toJson(request);
     tableExistsNative(nativeDirectoryNamespaceHandle, requestJson);
+    return new TableExistsResponse();
   }
 
   @Override
@@ -381,10 +391,11 @@ public class DirectoryNamespace implements LanceNamespace, Closeable {
   }
 
   @Override
-  public Long countTableRows(CountTableRowsRequest request) {
+  public CountTableRowsResponse countTableRows(CountTableRowsRequest request) {
     ensureInitialized();
     String requestJson = toJson(request);
-    return countTableRowsNative(nativeDirectoryNamespaceHandle, requestJson);
+    Long count = countTableRowsNative(nativeDirectoryNamespaceHandle, requestJson);
+    return new CountTableRowsResponse().count(count);
   }
 
   @Override
@@ -449,10 +460,11 @@ public class DirectoryNamespace implements LanceNamespace, Closeable {
   }
 
   @Override
-  public byte[] queryTable(QueryTableRequest request) {
+  public QueryTableResponse queryTable(QueryTableRequest request) {
     ensureInitialized();
     String requestJson = toJson(request);
-    return queryTableNative(nativeDirectoryNamespaceHandle, requestJson);
+    byte[] data = queryTableNative(nativeDirectoryNamespaceHandle, requestJson);
+    return new QueryTableResponse().data(data);
   }
 
   @Override
@@ -663,6 +675,15 @@ public class DirectoryNamespace implements LanceNamespace, Closeable {
   }
 
   @Override
+  public CreateMaterializedViewResponse createMaterializedView(
+      CreateMaterializedViewRequest request) {
+    ensureInitialized();
+    String requestJson = toJson(request);
+    String responseJson = createMaterializedViewNative(nativeDirectoryNamespaceHandle, requestJson);
+    return fromJson(responseJson, CreateMaterializedViewResponse.class);
+  }
+
+  @Override
   public void close() {
     if (nativeDirectoryNamespaceHandle != 0) {
       releaseNative(nativeDirectoryNamespaceHandle);
@@ -829,6 +850,8 @@ public class DirectoryNamespace implements LanceNamespace, Closeable {
   private native String deleteTableTagNative(long handle, String requestJson);
 
   private native String updateTableTagNative(long handle, String requestJson);
+
+  private native String createMaterializedViewNative(long handle, String requestJson);
 
   private native Map<String, Long> retrieveOpsMetricsNative(long handle);
 

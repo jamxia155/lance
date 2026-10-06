@@ -11,6 +11,29 @@ use uuid::Uuid;
 use crate::dataset::Dataset;
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 
+/// A watermark marking how far into one shard's fresh tier a prior scan
+/// observed, so membership can be evaluated as of that point (see
+/// [`super::builder::LsmScanner::contains_pks_at`]).
+///
+/// Only the active memtable grows between two reads (appended batches, and a new
+/// generation when it rolls); everything at a lower generation — frozen and
+/// flushed — is immutable and was fully observed. The watermark includes lower
+/// generations whole, the active generation up to `active_batch_count` batches,
+/// and excludes higher generations (which appeared after it). It uses only the
+/// batch count and generation — both always available, unlike per-batch WAL
+/// positions, which the write path does not track. The bound only excludes rows
+/// the scan did not observe, so a stale watermark under-counts (a tolerable
+/// stale read) rather than dropping a row with no replacement.
+#[derive(Debug, Clone, Copy)]
+pub struct FreshTierWatermark {
+    /// Active generation the scan observed. Higher generations are excluded;
+    /// lower ones are immutable and included whole.
+    pub active_generation: u64,
+    /// Active-memtable batch count at snapshot time. Within the active
+    /// generation, only batches at index `< active_batch_count` were observed.
+    pub active_batch_count: u64,
+}
+
 /// Generation number in LSM tree.
 ///
 /// The base table has generation 0. MemTables have positive integers
@@ -21,7 +44,7 @@ use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 pub struct LsmGeneration(u64);
 
 impl LsmGeneration {
-    /// Generation for the base table (merged data).
+    /// Generation for the base table (compacted data).
     pub const BASE_TABLE: Self = Self(0);
 
     /// Create a generation for a MemTable.
@@ -70,12 +93,12 @@ impl Default for LsmGeneration {
     }
 }
 
-/// A flushed generation with its storage path.
+/// An SSTable with its storage path.
 #[derive(Debug, Clone)]
-pub struct FlushedGeneration {
+pub struct SsTable {
     /// Generation number.
     pub generation: u64,
-    /// Path to the flushed MemTable directory (relative to table root).
+    /// Path to the SSTable directory (relative to table root).
     pub path: String,
 }
 
@@ -91,8 +114,8 @@ pub struct ShardSnapshot {
     pub spec_id: u32,
     /// Current generation being written (next flush will be this generation).
     pub current_generation: u64,
-    /// List of flushed generations and their paths.
-    pub flushed_generations: Vec<FlushedGeneration>,
+    /// List of SSTables and their paths.
+    pub sstables: Vec<SsTable>,
 }
 
 impl ShardSnapshot {
@@ -102,7 +125,7 @@ impl ShardSnapshot {
             shard_id,
             spec_id: 0,
             current_generation: 1,
-            flushed_generations: Vec::new(),
+            sstables: Vec::new(),
         }
     }
 
@@ -118,10 +141,9 @@ impl ShardSnapshot {
         self
     }
 
-    /// Add a flushed generation.
-    pub fn with_flushed_generation(mut self, generation: u64, path: String) -> Self {
-        self.flushed_generations
-            .push(FlushedGeneration { generation, path });
+    /// Add an SSTable.
+    pub fn with_sstable(mut self, generation: u64, path: String) -> Self {
+        self.sstables.push(SsTable { generation, path });
         self
     }
 }
@@ -133,9 +155,9 @@ pub enum LsmDataSource {
         /// The base dataset.
         dataset: Arc<Dataset>,
     },
-    /// Flushed MemTable stored as Lance table on disk.
-    FlushedMemTable {
-        /// Absolute path to the flushed MemTable directory.
+    /// SSTable stored as Lance table on disk.
+    SsTable {
+        /// Absolute path to the SSTable directory.
         path: String,
         /// Shard this MemTable belongs to.
         shard_id: Uuid,
@@ -162,7 +184,7 @@ impl LsmDataSource {
     pub fn generation(&self) -> LsmGeneration {
         match self {
             Self::BaseTable { .. } => LsmGeneration::BASE_TABLE,
-            Self::FlushedMemTable { generation, .. } => *generation,
+            Self::SsTable { generation, .. } => *generation,
             Self::ActiveMemTable { generation, .. } => *generation,
         }
     }
@@ -171,7 +193,7 @@ impl LsmDataSource {
     pub fn shard_id(&self) -> Option<Uuid> {
         match self {
             Self::BaseTable { .. } => None,
-            Self::FlushedMemTable { shard_id, .. } => Some(*shard_id),
+            Self::SsTable { shard_id, .. } => Some(*shard_id),
             Self::ActiveMemTable { shard_id, .. } => Some(*shard_id),
         }
     }
@@ -190,7 +212,7 @@ impl LsmDataSource {
     pub fn display_name(&self) -> String {
         match self {
             Self::BaseTable { .. } => "base_table".to_string(),
-            Self::FlushedMemTable {
+            Self::SsTable {
                 shard_id,
                 generation,
                 ..
@@ -256,14 +278,14 @@ mod tests {
         let snapshot = ShardSnapshot::new(shard_id)
             .with_spec_id(1)
             .with_current_generation(5)
-            .with_flushed_generation(1, "abc123_gen_1".to_string())
-            .with_flushed_generation(2, "def456_gen_2".to_string());
+            .with_sstable(1, "abc123_gen_1".to_string())
+            .with_sstable(2, "def456_gen_2".to_string());
 
         assert_eq!(snapshot.shard_id, shard_id);
         assert_eq!(snapshot.spec_id, 1);
         assert_eq!(snapshot.current_generation, 5);
-        assert_eq!(snapshot.flushed_generations.len(), 2);
-        assert_eq!(snapshot.flushed_generations[0].generation, 1);
-        assert_eq!(snapshot.flushed_generations[1].generation, 2);
+        assert_eq!(snapshot.sstables.len(), 2);
+        assert_eq!(snapshot.sstables[0].generation, 1);
+        assert_eq!(snapshot.sstables[1].generation, 2);
     }
 }

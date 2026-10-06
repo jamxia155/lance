@@ -24,6 +24,7 @@ public class Query {
 
   private final String column;
   private final float[] key;
+  private final int queryVectorDim;
   private final int k;
   private final int minimumNprobes;
   private final Optional<Integer> maximumNprobes;
@@ -31,11 +32,21 @@ public class Query {
   private final Optional<Integer> refineFactor;
   private final Optional<DistanceType> distanceType;
   private final boolean useIndex;
+  private final int queryParallelism;
+  private final ApproxMode approxMode;
 
   private Query(Builder builder) {
     this.column = Preconditions.checkNotNull(builder.column, "Columns must be set");
     Preconditions.checkArgument(!builder.column.isEmpty(), "Column must not be empty");
     this.key = Preconditions.checkNotNull(builder.key, "Key must be set");
+    Preconditions.checkArgument(
+        builder.queryVectorDim >= 0, "Query vector dimension must not be negative");
+    if (builder.queryVectorDim > 0) {
+      Preconditions.checkArgument(
+          builder.key.length > 0 && builder.key.length % builder.queryVectorDim == 0,
+          "Batch query buffer length must be a positive multiple of the query vector dimension");
+    }
+    this.queryVectorDim = builder.queryVectorDim;
     Preconditions.checkArgument(builder.k > 0, "K must be greater than 0");
     Preconditions.checkArgument(
         builder.minimumNprobes > 0, "Minimum Nprobes must be greater than 0");
@@ -50,6 +61,8 @@ public class Query {
     this.refineFactor = builder.refineFactor;
     this.distanceType = builder.distanceType;
     this.useIndex = builder.useIndex;
+    this.queryParallelism = builder.queryParallelism;
+    this.approxMode = builder.approxMode;
   }
 
   public String getColumn() {
@@ -58,6 +71,16 @@ public class Query {
 
   public float[] getKey() {
     return key;
+  }
+
+  /**
+   * Returns the length of each query vector when {@link #getKey()} packs a batch of query vectors,
+   * or {@code 0} for a single-vector query.
+   *
+   * @return The per-vector dimension of a batch query, or {@code 0} for a single-vector query.
+   */
+  public int getQueryVectorDim() {
+    return queryVectorDim;
   }
 
   public int getK() {
@@ -92,11 +115,24 @@ public class Query {
     return useIndex;
   }
 
+  public int getQueryParallelism() {
+    return queryParallelism;
+  }
+
+  public ApproxMode getApproxMode() {
+    return approxMode;
+  }
+
+  public String getApproxModeString() {
+    return approxMode.toRustString();
+  }
+
   @Override
   public String toString() {
     return MoreObjects.toStringHelper(this)
         .add("column", column)
         .add("key", key)
+        .add("queryVectorDim", queryVectorDim)
         .add("k", k)
         .add("minimumNprobes", minimumNprobes)
         .add("maximumNprobes", maximumNprobes.orElse(null))
@@ -104,12 +140,15 @@ public class Query {
         .add("refineFactor", refineFactor.orElse(null))
         .add("distanceType", distanceType.orElse(null))
         .add("useIndex", useIndex)
+        .add("queryParallelism", queryParallelism)
+        .add("approxMode", approxMode)
         .toString();
   }
 
   public static class Builder {
     private String column;
     private float[] key;
+    private int queryVectorDim = 0;
     private int k = 10;
     private int minimumNprobes = 1;
     private Optional<Integer> maximumNprobes = Optional.empty();
@@ -117,6 +156,8 @@ public class Query {
     private Optional<Integer> refineFactor = Optional.empty();
     private Optional<DistanceType> distanceType = Optional.empty();
     private boolean useIndex = true;
+    private int queryParallelism = 0;
+    private ApproxMode approxMode = ApproxMode.NORMAL;
 
     /**
      * Sets the column to be searched.
@@ -132,11 +173,59 @@ public class Query {
     /**
      * Sets the vector to be searched.
      *
+     * <p>This API accepts a single query vector. The array length must match the target vector
+     * column dimension. To search multiple query vectors in one scan, use {@link
+     * #setKeys(float[][])}.
+     *
      * @param key The search vector.
      * @return The Builder instance for method chaining.
      */
     public Builder setKey(float[] key) {
       this.key = key;
+      this.queryVectorDim = 0;
+      return this;
+    }
+
+    /**
+     * Sets multiple query vectors for a batch nearest-neighbor search.
+     *
+     * <p>Every row must be non-null and share the same length, which must match the target vector
+     * column dimension. The rows are flattened row-major into a single query buffer.
+     *
+     * <p>Unlike {@link #setKey(float[])}, a batch query prepends a non-nullable {@code query_index}
+     * column holding the zero-based offset of the query vector that produced each row, and returns
+     * up to {@code k} rows per query vector (results are grouped by {@code query_index}, ordered by
+     * distance within each group). This column is added even when a single query vector is
+     * supplied. The scan fails if the dataset already contains a column named {@code query_index}.
+     *
+     * <p>Scan-level {@code limit} / {@code offset} apply to the combined result across all query
+     * vectors, not per query vector. Batch search is not supported on multivector columns.
+     *
+     * @param keys The search vectors, one per row.
+     * @return The Builder instance for method chaining.
+     */
+    public Builder setKeys(float[][] keys) {
+      Preconditions.checkNotNull(keys, "Keys must not be null");
+      Preconditions.checkArgument(keys.length > 0, "Keys must not be empty");
+      Preconditions.checkNotNull(keys[0], "Query vector must not be null");
+      int dim = keys[0].length;
+      Preconditions.checkArgument(dim > 0, "Query vector dimension must be greater than 0");
+      long totalLength = (long) keys.length * dim;
+      Preconditions.checkArgument(
+          totalLength <= Integer.MAX_VALUE,
+          "Batch query of %s vectors x %s dimensions exceeds the maximum buffer length %s",
+          keys.length,
+          dim,
+          Integer.MAX_VALUE);
+      float[] flattened = new float[(int) totalLength];
+      for (int i = 0; i < keys.length; i++) {
+        Preconditions.checkNotNull(keys[i], "Query vector must not be null");
+        Preconditions.checkArgument(
+            keys[i].length == dim, "All query vectors must have the same dimension");
+        System.arraycopy(keys[i], 0, flattened, i * dim, dim);
+      }
+      this.key = flattened;
+      this.queryVectorDim = dim;
       return this;
     }
 
@@ -154,8 +243,7 @@ public class Query {
     /**
      * Sets the number of probes to load and search.
      *
-     * <p>This is a convenience method that sets both the minimum and maximum number of probes to
-     * the same value.
+     * <p>This sets both the minimum and maximum number of probes to the same value.
      *
      * @param nprobes The number of probes.
      * @return The Builder instance for method chaining.
@@ -242,6 +330,38 @@ public class Query {
      */
     public Builder setUseIndex(boolean useIndex) {
       this.useIndex = useIndex;
+      return this;
+    }
+
+    /**
+     * Sets vector partition search concurrency for each query.
+     *
+     * <p>The default is 0. Value 0 uses the automatic policy, which currently maps to the
+     * single-worker sequential path. Value -1 uses the CPU pool size. Value 1 uses the
+     * single-worker sequential path. Values greater than or equal to 2 use the partition-parallel
+     * path and are clamped to the CPU pool size.
+     *
+     * @param queryParallelism The partition search concurrency policy.
+     * @return The Builder instance for method chaining.
+     */
+    public Builder setQueryParallelism(int queryParallelism) {
+      Preconditions.checkArgument(
+          queryParallelism >= -1, "Query parallelism must be greater than or equal to -1");
+      this.queryParallelism = queryParallelism;
+      return this;
+    }
+
+    /**
+     * Sets the speed / accuracy tradeoff for approximate vector search.
+     *
+     * <p>This setting currently only affects RQ-quantized vector indexes, such as IVF_RQ. Other
+     * index types ignore this setting.
+     *
+     * @param approxMode The approximate search mode to use for the query.
+     * @return The Builder instance for method chaining.
+     */
+    public Builder setApproxMode(ApproxMode approxMode) {
+      this.approxMode = Preconditions.checkNotNull(approxMode, "ApproxMode must not be null");
       return this;
     }
 

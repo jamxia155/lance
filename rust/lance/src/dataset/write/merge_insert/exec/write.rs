@@ -2,7 +2,10 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 
 use arrow_array::{Array, RecordBatch, UInt8Array, UInt64Array};
 use arrow_schema::Schema;
@@ -19,6 +22,7 @@ use datafusion::{
 };
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
 use futures::{StreamExt, stream};
+use lance_arrow::RecordBatchExt;
 use lance_core::{Error, ROW_ADDR, ROW_ID};
 use lance_table::format::RowIdMeta;
 use roaring::RoaringTreemap;
@@ -29,15 +33,15 @@ use crate::dataset::write::merge_insert::inserted_rows::{
     KeyExistenceFilter, KeyExistenceFilterBuilder, extract_key_value_from_batch,
 };
 use crate::dataset::write::merge_insert::{
-    MERGE_SOURCE_SENTINEL, SourceDedupeBehavior, create_duplicate_row_error,
-    format_key_values_on_columns,
+    InsertedKeyTracker, MERGE_SOURCE_SENTINEL, SourceDedupeBehavior, canonical_source_schema,
+    create_duplicate_row_error, format_key_values_on_columns, resolve_target_bases,
 };
 use crate::{
     Dataset,
     dataset::{
         transaction::{Operation, Transaction},
         write::{
-            WriteParams,
+            WriteParams, blob_v2_external_base_resolver, cleanup_data_fragments,
             merge_insert::{
                 MERGE_ACTION_COLUMN, MergeInsertParams, MergeStats, assign_action::Action,
                 exec::MergeInsertMetrics,
@@ -63,6 +67,8 @@ struct MergeState {
     stable_row_ids: bool,
     /// Set to track processed row IDs to detect duplicates
     processed_row_ids: HashSet<u64>,
+    /// Set to track non-null keys of rows inserted by FirstSeen mode
+    processed_insert_keys: InsertedKeyTracker,
     /// The "on" column names for merge operation
     on_columns: Vec<String>,
     /// How to handle duplicate source rows
@@ -84,6 +90,7 @@ impl MergeState {
             metrics,
             stable_row_ids,
             processed_row_ids: HashSet::new(),
+            processed_insert_keys: InsertedKeyTracker::default(),
             on_columns,
             source_dedupe_behavior,
         }
@@ -103,6 +110,29 @@ impl MergeState {
                 // Delete action - only delete, don't write back
                 if !row_addr_array.is_null(row_idx) {
                     let row_addr = row_addr_array.value(row_idx);
+                    let row_id = row_id_array.value(row_idx);
+
+                    // A source with duplicate keys matches the same target row
+                    // more than once; apply the same dedupe policy as updates.
+                    // (Target-only deletes from `delete_not_matched_by_source`
+                    // also reach here but never duplicate, so they never trip
+                    // `Fail`.)
+                    if !self.processed_row_ids.insert(row_id) {
+                        match self.source_dedupe_behavior {
+                            SourceDedupeBehavior::Fail => {
+                                return Err(create_duplicate_row_error(
+                                    batch,
+                                    row_idx,
+                                    &self.on_columns,
+                                ));
+                            }
+                            SourceDedupeBehavior::FirstSeen => {
+                                self.metrics.num_skipped_duplicates.add(1);
+                                return Ok(None); // Skip this duplicate row
+                            }
+                        }
+                    }
+
                     self.delete_row_addrs.insert(row_addr);
                     self.metrics.num_deleted_rows.add(1);
                 }
@@ -143,7 +173,15 @@ impl MergeState {
                 Ok(Some(row_idx)) // Keep this row for writing
             }
             Action::Insert => {
-                // Insert action - just insert new data
+                if self.source_dedupe_behavior == SourceDedupeBehavior::FirstSeen
+                    && !self
+                        .processed_insert_keys
+                        .insert(batch, row_idx, &self.on_columns)?
+                {
+                    self.metrics.num_skipped_duplicates.add(1);
+                    return Ok(None);
+                }
+
                 // Capture the key value for conflict detection (only for inserts, not updates)
                 if let Some(key_value) =
                     extract_key_value_from_batch(batch, row_idx, &self.on_columns)
@@ -182,12 +220,14 @@ pub struct FullSchemaMergeInsertExec {
     input: Arc<dyn ExecutionPlan>,
     dataset: Arc<Dataset>,
     params: MergeInsertParams,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
     merge_stats: Arc<Mutex<Option<MergeStats>>>,
     transaction: Arc<Mutex<Option<Transaction>>>,
     affected_rows: Arc<Mutex<Option<RoaringTreemap>>>,
     inserted_rows_filter: Arc<Mutex<Option<KeyExistenceFilter>>>,
+    source_skipped_duplicates: Arc<AtomicU64>,
+    source_blob_columns: Vec<String>,
     /// Whether the ON columns match the schema's unenforced primary key.
     /// If true, inserted_rows_filter will be included in the transaction for conflict detection.
     is_primary_key: bool,
@@ -198,14 +238,16 @@ impl FullSchemaMergeInsertExec {
         input: Arc<dyn ExecutionPlan>,
         dataset: Arc<Dataset>,
         params: MergeInsertParams,
+        source_skipped_duplicates: Arc<AtomicU64>,
+        source_blob_columns: Vec<String>,
     ) -> DFResult<Self> {
         let empty_schema = Arc::new(arrow_schema::Schema::empty());
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(empty_schema),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Final,
             Boundedness::Bounded,
-        );
+        ));
 
         // Check if ON columns match the schema's unenforced primary key
         let field_ids: Vec<i32> = params
@@ -231,6 +273,8 @@ impl FullSchemaMergeInsertExec {
             transaction: Arc::new(Mutex::new(None)),
             affected_rows: Arc::new(Mutex::new(None)),
             inserted_rows_filter: Arc::new(Mutex::new(None)),
+            source_skipped_duplicates,
+            source_blob_columns,
             is_primary_key,
         })
     }
@@ -414,26 +458,50 @@ impl FullSchemaMergeInsertExec {
                 ))
             })?;
 
-        // Find all data columns to write (everything except special columns)
-        // The schema from DataFusion optimization may have collapsed duplicate columns
-        // from the logical join, leaving us with the merged data columns plus special columns
-        let total_fields = input_schema.fields().len();
+        // Emit data columns in dataset-schema order, keyed by name. This
+        // matters for partial-schema upserts, where `create_plan` adds
+        // synthetic unqualified columns (filled from the target side) at
+        // the end of the logical projection. Without name-based reordering
+        // they would land at the end of the write stream and mismatch the
+        // intended writer schema (which is `dataset.schema()`). Using name
+        // lookup is also a strictly-safer choice for the full-schema path:
+        // it turns an implicit positional assumption into an explicit
+        // name-based invariant. The filtered batches are recursively projected
+        // to this schema below so nested children follow the same contract.
+        let mut name_to_idx: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::with_capacity(input_schema.fields().len());
+        for (idx, field) in input_schema.fields().iter().enumerate() {
+            let name = field.name();
+            // Skip special columns: _rowaddr, _rowid, __action, and the
+            // source-presence sentinel.
+            if idx == rowaddr_idx
+                || idx == rowid_idx
+                || idx == action_idx
+                || name == ROW_ADDR
+                || name == ROW_ID
+                || name == MERGE_ACTION_COLUMN
+                || name == MERGE_SOURCE_SENTINEL
+            {
+                continue;
+            }
+            name_to_idx.insert(name.as_str(), idx);
+        }
 
-        // Select all columns that are data columns (not _rowaddr, __action, or the sentinel)
-        // These represent the final merged data values to write
-        let data_column_indices: Vec<usize> = (0..total_fields)
-            .filter(|&idx| {
-                let field = input_schema.field(idx);
-                let name = field.name();
-                // Skip special columns: _rowaddr, __action, and the source-presence sentinel
-                idx != rowaddr_idx
-                    && idx != action_idx
-                    && name != ROW_ADDR
-                    && name != ROW_ID
-                    && name != MERGE_ACTION_COLUMN
-                    && name != MERGE_SOURCE_SENTINEL
-            })
-            .collect();
+        let dataset_arrow_schema: arrow_schema::Schema = self.dataset.schema().into();
+        let dataset_fields = dataset_arrow_schema.fields();
+        let mut data_column_indices: Vec<usize> = Vec::with_capacity(dataset_fields.len());
+        for dataset_field in dataset_fields {
+            let idx = *name_to_idx
+                .get(dataset_field.name().as_str())
+                .ok_or_else(|| {
+                    datafusion::error::DataFusionError::Internal(format!(
+                        "Dataset field {:?} missing from merge insert input schema \
+                     — this indicates a logical plan pruning bug",
+                        dataset_field.name()
+                    ))
+                })?;
+            data_column_indices.push(idx);
+        }
 
         if data_column_indices.is_empty() {
             return Err(datafusion::error::DataFusionError::Internal(
@@ -441,15 +509,16 @@ impl FullSchemaMergeInsertExec {
             ));
         }
 
-        // Create output schema with only data columns
-        let output_fields: Vec<_> = data_column_indices
-            .iter()
-            .map(|&idx| {
-                let field = input_schema.field(idx);
-                Arc::new(field.clone())
-            })
-            .collect();
-        let output_schema = Arc::new(Schema::new(output_fields));
+        let source_data_schema = Schema::new(
+            data_column_indices
+                .iter()
+                .map(|idx| input_schema.field(*idx).clone())
+                .collect::<Vec<_>>(),
+        );
+        let output_schema = Arc::new(
+            canonical_source_schema(&source_data_schema, &dataset_arrow_schema)
+                .map_err(datafusion::error::DataFusionError::from)?,
+        );
 
         Ok((
             input_schema,
@@ -527,13 +596,12 @@ impl FullSchemaMergeInsertExec {
         // Take only the rows we want to keep
         let filtered_batch = arrow_select::take::take_record_batch(batch, &indices)?;
 
-        // Project only the data columns
-        let output_columns: Vec<_> = data_column_indices
-            .iter()
-            .map(|&idx| filtered_batch.column(idx).clone())
-            .collect();
-
-        RecordBatch::try_new(output_schema, output_columns)
+        // First retain the source field layout, then recursively project it into
+        // the dataset layout. The latter is required for nested structs whose
+        // children were supplied in a different order.
+        let projected = filtered_batch.project(data_column_indices)?;
+        projected
+            .project_by_schema(output_schema.as_ref())
             .map_err(datafusion::error::DataFusionError::from)
     }
 
@@ -568,32 +636,50 @@ impl FullSchemaMergeInsertExec {
         let output_schema_clone = output_schema.clone();
         let merge_state_clone = merge_state;
 
+        // The splitter owns both senders, so a panic inside it drops them and
+        // the receivers would see end-of-stream — a partial merge committed
+        // with no error. Catch the unwind and forward it as a stream error
+        // instead, so the writer fails and the transaction is never stored.
+        // The clones outlive the unwound future; we never resume it, so the
+        // `AssertUnwindSafe` bound is fine.
+        let panic_update_tx = update_tx.clone();
+        let panic_insert_tx = insert_tx.clone();
         tokio::spawn(async move {
-            let mut input_stream = input_stream;
+            let result =
+                futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async move {
+                    let mut input_stream = input_stream;
 
-            while let Some(batch_result) = input_stream.next().await {
-                match batch_result {
-                    Ok(batch) => {
-                        match Self::process_and_split_batch(
-                            &batch,
-                            rowaddr_idx,
-                            rowid_idx,
-                            action_idx,
-                            &data_column_indices,
-                            output_schema_clone.clone(),
-                            merge_state_clone.clone(),
-                        ) {
-                            Ok((update_batch_opt, insert_batch_opt)) => {
-                                if let Some(update_batch) = update_batch_opt
-                                    && update_tx.send(Ok(update_batch)).is_err()
-                                {
-                                    break;
-                                }
+                    while let Some(batch_result) = input_stream.next().await {
+                        match batch_result {
+                            Ok(batch) => {
+                                match Self::process_and_split_batch(
+                                    &batch,
+                                    rowaddr_idx,
+                                    rowid_idx,
+                                    action_idx,
+                                    &data_column_indices,
+                                    output_schema_clone.clone(),
+                                    merge_state_clone.clone(),
+                                ) {
+                                    Ok((update_batch_opt, insert_batch_opt)) => {
+                                        if let Some(update_batch) = update_batch_opt
+                                            && update_tx.send(Ok(update_batch)).is_err()
+                                        {
+                                            break;
+                                        }
 
-                                if let Some(insert_batch) = insert_batch_opt
-                                    && insert_tx.send(Ok(insert_batch)).is_err()
-                                {
-                                    break;
+                                        if let Some(insert_batch) = insert_batch_opt
+                                            && insert_tx.send(Ok(insert_batch)).is_err()
+                                        {
+                                            break;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        Self::handle_stream_processing_error(
+                                            e, &update_tx, &insert_tx,
+                                        );
+                                        break;
+                                    }
                                 }
                             }
                             Err(e) => {
@@ -602,11 +688,24 @@ impl FullSchemaMergeInsertExec {
                             }
                         }
                     }
-                    Err(e) => {
-                        Self::handle_stream_processing_error(e, &update_tx, &insert_tx);
-                        break;
-                    }
-                }
+                }))
+                .await;
+
+            if let Err(panic) = result {
+                let panic_msg = if let Some(msg) = panic.downcast_ref::<&str>() {
+                    (*msg).to_string()
+                } else if let Some(msg) = panic.downcast_ref::<String>() {
+                    msg.clone()
+                } else {
+                    "unknown panic payload".to_string()
+                };
+                Self::handle_stream_processing_error(
+                    datafusion::error::DataFusionError::Execution(format!(
+                        "merge insert stream splitter panicked: {panic_msg}"
+                    )),
+                    &panic_update_tx,
+                    &panic_insert_tx,
+                );
             }
         });
 
@@ -721,6 +820,9 @@ impl DisplayAs for FullSchemaMergeInsertExec {
                     crate::dataset::WhenMatched::UpdateIf(condition) => {
                         format!("UpdateIf({})", condition)
                     }
+                    crate::dataset::WhenMatched::UpdateIfExpr(expr) => {
+                        format!("UpdateIf({})", expr.human_display())
+                    }
                     crate::dataset::WhenMatched::Fail => "Fail".to_string(),
                     crate::dataset::WhenMatched::Delete => "Delete".to_string(),
                 };
@@ -753,10 +855,6 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
         "FullSchemaMergeInsertExec"
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn schema(&self) -> arrow_schema::SchemaRef {
         Arc::new(arrow_schema::Schema::empty())
     }
@@ -784,6 +882,8 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
             transaction: self.transaction.clone(),
             affected_rows: self.affected_rows.clone(),
             inserted_rows_filter: self.inserted_rows_filter.clone(),
+            source_skipped_duplicates: self.source_skipped_duplicates.clone(),
+            source_blob_columns: self.source_blob_columns.clone(),
             is_primary_key: self.is_primary_key,
         }))
     }
@@ -792,7 +892,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
         Some(self.metrics.clone_inner())
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -824,6 +924,39 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
 
         // Execute the input plan to get the merge data stream
         let input_stream = self.input.execute(partition, context)?;
+        let has_blob_v2_columns = self
+            .dataset
+            .schema()
+            .fields_pre_order()
+            .any(|field| field.is_blob_v2());
+        let input_stream = if has_blob_v2_columns {
+            let input_schema = input_stream.schema();
+            let rewrite_plan = Arc::new(
+                crate::dataset::optimize::BlobV2BatchRewritePlan::try_new(
+                    self.dataset.schema(),
+                    input_schema.as_ref(),
+                    true,
+                )
+                .map_err(|error| DataFusionError::External(Box::new(error)))?,
+            );
+            let output_schema = rewrite_plan.output_schema().clone();
+            let dataset = self.dataset.clone();
+            let transformed = input_stream.then(move |batch_result| {
+                let dataset = dataset.clone();
+                let rewrite_plan = rewrite_plan.clone();
+                async move {
+                    let batch = batch_result?;
+                    rewrite_plan
+                        .transform_batch(&dataset, batch)
+                        .await
+                        .map_err(|error| DataFusionError::External(Box::new(error)))
+                }
+            });
+            Box::pin(RecordBatchStreamAdapter::new(output_schema, transformed))
+                as SendableRecordBatchStream
+        } else {
+            input_stream
+        };
 
         // Step 1: Create shared state and streaming processor for row addresses and write data
         // Get field IDs for the ON columns from the dataset schema
@@ -845,11 +978,14 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
 
         // Use flat_map to handle the async write operation
         let dataset = self.dataset.clone();
+        let params = self.params.clone();
         let merge_stats_holder = self.merge_stats.clone();
         let transaction_holder = self.transaction.clone();
         let affected_rows_holder = self.affected_rows.clone();
         let inserted_rows_filter_holder = self.inserted_rows_filter.clone();
-        let merged_generations = self.params.merged_generations.clone();
+        let compacted_sstables = self.params.compacted_sstables.clone();
+        let source_skipped_duplicates = self.source_skipped_duplicates.clone();
+        let source_blob_columns = self.source_blob_columns.clone();
         let is_primary_key = self.is_primary_key;
         let updating_row_ids = {
             let state = merge_state.lock().unwrap();
@@ -858,38 +994,94 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
 
         let result_stream = stream::once(async move {
             // Step 2: Write new fragments using the filtered data (inserts + updates)
+            let target_bases_info = resolve_target_bases(&dataset, &params).await?;
+            // Keep a copy so failures after the write can clean up routed files.
+            let cleanup_bases = target_bases_info.clone();
+            let write_params = WriteParams {
+                allow_external_blob_outside_bases: has_blob_v2_columns,
+                ..Default::default()
+            };
+            // Existing target references may be outside the current bases. Check
+            // only source-provided blob columns before allowing them through.
+            let write_data_stream = if source_blob_columns.is_empty() {
+                write_data_stream
+            } else {
+                let resolver =
+                    blob_v2_external_base_resolver(Some(&dataset), &write_params, dataset.schema())
+                        .await?
+                        .ok_or_else(|| {
+                            Error::internal("Source has blob v2 columns but target does not")
+                        })?;
+                let schema = write_data_stream.schema();
+                let source_blob_column_indices = source_blob_columns
+                    .iter()
+                    .map(|name| schema.index_of(name).map_err(Error::from))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let validated = write_data_stream.then(move |batch_result| {
+                    let resolver = resolver.clone();
+                    let source_blob_column_indices = source_blob_column_indices.clone();
+                    async move {
+                        let batch = batch_result?;
+                        let source_blob_batch = batch.project(&source_blob_column_indices)?;
+                        crate::dataset::blob::validate_external_blob_references(
+                            &resolver,
+                            &source_blob_batch,
+                            &vec![true; batch.num_rows()],
+                        )
+                        .await
+                        .map_err(|error| DataFusionError::External(Box::new(error)))?;
+                        Ok(batch)
+                    }
+                });
+                Box::pin(RecordBatchStreamAdapter::new(schema, validated))
+                    as SendableRecordBatchStream
+            };
             let (mut new_fragments, _) = write_fragments_internal(
+                params.write_version(&dataset),
                 Some(&dataset),
                 dataset.object_store.clone(),
                 &dataset.base,
                 dataset.schema().clone(),
                 write_data_stream,
-                WriteParams::default(),
-                None, // Merge insert doesn't use target_bases
+                write_params,
+                target_bases_info,
             )
             .await?;
 
-            if let Some(row_id_sequence) = updating_row_ids.lock().unwrap().row_id_sequence() {
-                let fragment_sizes = new_fragments
-                    .iter()
-                    .map(|f| f.physical_rows.unwrap() as u64);
+            let row_id_result: lance_core::Result<()> = (|| {
+                if let Some(row_id_sequence) = updating_row_ids.lock().unwrap().row_id_sequence() {
+                    let fragment_sizes = new_fragments
+                        .iter()
+                        .map(|f| f.physical_rows.unwrap() as u64);
 
-                let sequences = lance_table::rowids::rechunk_sequences(
-                    [row_id_sequence.clone()],
-                    fragment_sizes,
-                    true,
-                )
-                .map_err(|e| {
-                    Error::internal(format!(
-                        "Captured row ids not equal to number of rows written: {}",
-                        e
-                    ))
-                })?;
+                    let sequences = lance_table::rowids::rechunk_sequences(
+                        [row_id_sequence.clone()],
+                        fragment_sizes,
+                        true,
+                    )
+                    .map_err(|e| {
+                        Error::internal(format!(
+                            "Captured row ids not equal to number of rows written: {}",
+                            e
+                        ))
+                    })?;
 
-                for (fragment, sequence) in new_fragments.iter_mut().zip(sequences) {
-                    let serialized = lance_table::rowids::write_row_ids(&sequence);
-                    fragment.row_id_meta = Some(RowIdMeta::Inline(serialized));
+                    for (fragment, sequence) in new_fragments.iter_mut().zip(sequences) {
+                        let serialized = lance_table::rowids::write_row_ids(&sequence);
+                        fragment.row_id_meta = Some(RowIdMeta::Inline(serialized.into()));
+                    }
                 }
+                Ok(())
+            })();
+            if let Err(e) = row_id_result {
+                cleanup_data_fragments(
+                    &dataset.object_store,
+                    &dataset.base,
+                    cleanup_bases.as_deref(),
+                    &new_fragments,
+                )
+                .await;
+                return Err(e.into());
             }
 
             // Step 2.5: Calculate write metrics from new fragments
@@ -911,7 +1103,21 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
             };
 
             let (updated_fragments, removed_fragment_ids) =
-                apply_deletions(&dataset, &delete_row_addrs_clone).await?;
+                match apply_deletions(&dataset, &delete_row_addrs_clone).await {
+                    Ok(result) => result,
+                    Err(e) => {
+                        // The new data files are not committed; remove them (including
+                        // ones routed to target bases) before surfacing the error.
+                        cleanup_data_fragments(
+                            &dataset.object_store,
+                            &dataset.base,
+                            cleanup_bases.as_deref(),
+                            &new_fragments,
+                        )
+                        .await;
+                        return Err(e.into());
+                    }
+                };
 
             // Step 4: Create the transaction operation
             let operation = Operation::Update {
@@ -919,15 +1125,20 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
                 updated_fragments,
                 new_fragments,
                 fields_modified: vec![], // No fields are modified in schema for upsert
-                merged_generations,
+                compacted_sstables,
+                // Use the full pre-order field list (not just top-level `fields`) so
+                // that nested leaf field ids are included. A merge_insert rewrites whole
+                // rows, so every field is potentially modified; omitting nested ids would
+                // let `register_pure_rewrite_rows_update_frags_in_indices` wrongly extend a
+                // nested-field index over the rewritten fragment, silently dropping rows.
                 fields_for_preserving_frag_bitmap: dataset
                     .schema()
-                    .fields
-                    .iter()
+                    .fields_pre_order()
                     .map(|f| f.id as u32)
                     .collect(),
                 update_mode: Some(RewriteRows),
                 inserted_rows_filter: inserted_rows_filter.clone(),
+                updated_fragment_offsets: None,
             };
 
             // Step 5: Create and store the transaction
@@ -943,7 +1154,15 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
                     .add(total_files_written);
 
                 // Get the final stats from the shared state
-                let stats = MergeStats::from(&merge_state.metrics);
+                let mut stats = MergeStats::from(&merge_state.metrics);
+                stats.num_skipped_duplicates = stats
+                    .num_skipped_duplicates
+                    .checked_add(source_skipped_duplicates.load(Ordering::Relaxed))
+                    .ok_or_else(|| {
+                        DataFusionError::Execution(
+                            "merge insert skipped duplicate count overflowed u64".to_string(),
+                        )
+                    })?;
 
                 if let Ok(mut transaction_guard) = transaction_holder.lock() {
                     transaction_guard.replace(transaction);
@@ -977,6 +1196,110 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
 mod tests {
     use super::*;
     use arrow_array::UInt64Array;
+
+    use crate::dataset::write::merge_insert::{MergeInsertBuilder, WhenMatched, WhenNotMatched};
+
+    // A panic in the detached splitter task must surface on the output
+    // streams as an error. The task owns the channel senders, so an unwind
+    // drops them and the receivers cannot distinguish "writer panicked" from
+    // end-of-stream — without a guard, a partial merge is silently committed.
+    // The poisoned `updating_row_ids` mutex stands in for any panic source.
+    #[tokio::test]
+    async fn splitter_panic_surfaces_as_stream_error() {
+        use arrow_array::Int32Array;
+        use datafusion::physical_plan::empty::EmptyExec;
+        use futures::TryStreamExt;
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("key", arrow_schema::DataType::UInt64, false),
+            arrow_schema::Field::new("value", arrow_schema::DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(vec![1u64])),
+                Arc::new(Int32Array::from(vec![42])),
+            ],
+        )
+        .unwrap();
+        let dataset = Dataset::write(
+            arrow_array::RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+            "memory://splitter-panic",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let job = MergeInsertBuilder::try_new(Arc::new(dataset.clone()), vec!["key".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap();
+        let exec = FullSchemaMergeInsertExec::try_new(
+            Arc::new(EmptyExec::new(schema.clone())),
+            Arc::new(dataset),
+            job.params.clone(),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            Vec::new(),
+        )
+        .unwrap();
+
+        let metrics = MergeInsertMetrics::new(&ExecutionPlanMetricsSet::new(), 0);
+        let merge_state = Arc::new(std::sync::Mutex::new(MergeState::new(
+            metrics,
+            true,
+            vec!["key".to_string()],
+            Vec::new(),
+            SourceDedupeBehavior::Fail,
+        )));
+
+        // Poison the captured-row-ids mutex so the splitter task panics when
+        // the UpdateAll row reaches the capture call.
+        {
+            let poison_target = merge_state.lock().unwrap().updating_row_ids.clone();
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _guard = poison_target.lock().unwrap();
+                panic!("poison the captured row ids mutex");
+            }));
+        }
+
+        let input_schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("key", arrow_schema::DataType::UInt64, false),
+            arrow_schema::Field::new("value", arrow_schema::DataType::Int32, false),
+            arrow_schema::Field::new(ROW_ADDR, arrow_schema::DataType::UInt64, true),
+            arrow_schema::Field::new(ROW_ID, arrow_schema::DataType::UInt64, true),
+            arrow_schema::Field::new(MERGE_ACTION_COLUMN, arrow_schema::DataType::UInt8, false),
+        ]));
+        let input_batch = RecordBatch::try_new(
+            input_schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(vec![1u64])),
+                Arc::new(Int32Array::from(vec![42])),
+                Arc::new(UInt64Array::from(vec![1u64 << 32])),
+                Arc::new(UInt64Array::from(vec![7u64])),
+                Arc::new(arrow_array::UInt8Array::from(vec![1u8])), // UpdateAll
+            ],
+        )
+        .unwrap();
+        let input_stream = Box::pin(RecordBatchStreamAdapter::new(
+            input_schema,
+            futures::stream::iter(vec![Ok(input_batch)]),
+        ));
+
+        let (update_stream, _insert_stream) = exec
+            .split_updates_and_inserts(input_stream, merge_state)
+            .unwrap();
+
+        let result: DFResult<Vec<RecordBatch>> = update_stream.try_collect().await;
+        let err = result.expect_err(
+            "a splitter panic must surface as a stream error, not a silent end-of-stream",
+        );
+        assert!(
+            err.to_string().to_lowercase().contains("panic"),
+            "error should name the panic, got: {err}"
+        );
+    }
 
     #[test]
     fn test_merge_state_duplicate_rowid_detection_fail() {

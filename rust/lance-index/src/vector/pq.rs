@@ -10,9 +10,9 @@ use arrow::datatypes::{self, ArrowPrimitiveType};
 use arrow_array::{Array, FixedSizeListArray, UInt8Array, cast::AsArray};
 use arrow_array::{ArrayRef, Float32Array, PrimitiveArray};
 use arrow_schema::{DataType, Field};
-use deepsize::DeepSizeOf;
 use distance::build_distance_table_dot;
 use lance_arrow::*;
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result, assume_eq};
 use lance_linalg::distance::{DistanceType, Dot, L2, l2::L2Prepared};
 use lance_table::utils::LanceIteratorExtension;
@@ -23,6 +23,7 @@ use tracing::instrument;
 
 pub mod builder;
 pub mod distance;
+pub(crate) mod pairwise;
 pub mod storage;
 pub mod transform;
 pub(crate) mod utils;
@@ -49,20 +50,20 @@ pub struct ProductQuantizer {
     /// Pre-transposed L2 targets per sub-vector for fast f32 L2 batch computation.
     /// Only populated when codebook is f32 and distance_type is L2
     /// (Cosine is converted to L2 before construction, so it benefits too).
-    l2_targets: Option<Vec<L2Prepared>>,
+    /// Wrapped in Arc so all clones (one per cached IVF partition) share one copy.
+    l2_targets: Option<Arc<Vec<L2Prepared>>>,
 }
 
 impl DeepSizeOf for ProductQuantizer {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
         self.codebook.get_array_memory_size()
             + self.num_sub_vectors.deep_size_of_children(_context)
             + self.num_bits.deep_size_of_children(_context)
             + self.dimension.deep_size_of_children(_context)
             + self.distance_type.deep_size_of_children(_context)
-            + self
-                .l2_targets
-                .as_ref()
-                .map_or(0, |v| v.iter().map(|t| t.size_bytes()).sum())
+            // deep_size_of_children on the Arc de-duplicates shared allocations
+            // via the context, so partitions sharing one l2_targets are counted once.
+            + self.l2_targets.deep_size_of_children(_context)
     }
 }
 
@@ -74,7 +75,7 @@ impl ProductQuantizer {
         num_sub_vectors: usize,
         num_bits: u32,
         dimension: usize,
-    ) -> Option<Vec<L2Prepared>> {
+    ) -> Option<Arc<Vec<L2Prepared>>> {
         if codebook.value_type() != DataType::Float32 || distance_type != DistanceType::L2 {
             return None;
         }
@@ -86,14 +87,14 @@ impl ProductQuantizer {
         let num_centroids = 2_usize.pow(num_bits);
         let block_size = sub_dim * num_centroids;
 
-        let targets = (0..num_sub_vectors)
+        let targets: Vec<L2Prepared> = (0..num_sub_vectors)
             .map(|sub_idx| {
                 let block_start = sub_idx * block_size;
                 let block = &values[block_start..block_start + block_size];
                 L2Prepared::new(block, sub_dim)
             })
             .collect();
-        Some(targets)
+        Some(Arc::new(targets))
     }
 
     pub fn new(
@@ -241,7 +242,9 @@ impl ProductQuantizer {
                         .collect();
                     if NUM_BITS == 4 {
                         sub_vec_code
-                            .chunks_exact(2)
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
                             .map(|v| (v[1] << 4) | v[0])
                             .collect::<Vec<_>>()
                     } else {
@@ -345,7 +348,6 @@ impl ProductQuantizer {
             self.num_bits,
             self.num_sub_vectors,
             code.values(),
-            0,
         );
 
         let diff = self.num_sub_vectors as f32 - 1.0;
@@ -361,7 +363,7 @@ impl ProductQuantizer {
             DataType::Float32 => {
                 if let Some(targets) = &self.l2_targets {
                     let query = key.as_primitive::<datatypes::Float32Type>().values();
-                    Ok(build_distance_table_l2_prepared(targets, query))
+                    Ok(build_distance_table_l2_prepared(targets.as_slice(), query))
                 } else {
                     Ok(self
                         .build_l2_distance_table_impl::<datatypes::Float32Type>(key.as_primitive()))
@@ -415,7 +417,6 @@ impl ProductQuantizer {
             self.num_bits,
             self.num_sub_vectors,
             code,
-            100,
         ))
     }
 
@@ -444,6 +445,45 @@ impl ProductQuantizer {
     }
 }
 
+/// Reject a caller-supplied codebook whose size disagrees with the column.
+///
+/// The codebook buffer is sliced by column-derived arithmetic downstream
+/// (`get_sub_vector_centroids` computes the sub-vector width as
+/// `dimension / num_sub_vectors`), so a wrong size is not a local error: an
+/// oversized codebook has its sub-vector boundaries read at the wrong offsets
+/// and trains a garbage index without complaining, and an undersized one slices
+/// out of bounds and panics.
+pub fn validate_supplied_codebook(
+    codebook_len: usize,
+    dimension: usize,
+    num_sub_vectors: usize,
+    num_bits: usize,
+) -> Result<()> {
+    if num_sub_vectors == 0 || dimension == 0 || !dimension.is_multiple_of(num_sub_vectors) {
+        return Err(Error::invalid_input(format!(
+            "PQ codebook requires a nonzero vector dimension divisible by num_sub_vectors, \
+             got dimension {dimension} and num_sub_vectors {num_sub_vectors}"
+        )));
+    }
+    let num_centroids = u32::try_from(num_bits)
+        .ok()
+        .filter(|num_bits| *num_bits > 0)
+        .and_then(|num_bits| 1usize.checked_shl(num_bits));
+    let expected = num_centroids.and_then(|num_centroids| num_centroids.checked_mul(dimension));
+    let (Some(num_centroids), Some(expected)) = (num_centroids, expected) else {
+        return Err(Error::invalid_input(format!(
+            "PQ codebook size is not representable: num_bits {num_bits}, dimension {dimension}"
+        )));
+    };
+    if codebook_len != expected {
+        return Err(Error::invalid_input(format!(
+            "PQ codebook has {codebook_len} values, but the vector column requires {expected} \
+             ({num_centroids} centroids x dimension {dimension} for num_bits {num_bits})"
+        )));
+    }
+    Ok(())
+}
+
 impl Quantization for ProductQuantizer {
     type BuildParams = PQBuildParams;
     type Metadata = ProductQuantizationMetadata;
@@ -461,10 +501,17 @@ impl Quantization for ProductQuantizer {
         )))?;
 
         if let Some(codebook) = params.codebook.as_ref() {
+            let dimension = fsl.value_length() as usize;
+            validate_supplied_codebook(
+                codebook.len(),
+                dimension,
+                params.num_sub_vectors,
+                params.num_bits,
+            )?;
             return Ok(Self::new(
                 params.num_sub_vectors,
                 params.num_bits as u32,
-                fsl.value_length() as usize,
+                dimension,
                 FixedSizeListArray::try_new_from_values(codebook.clone(), fsl.value_length())?,
                 distance_type,
             ));
@@ -691,6 +738,99 @@ mod tests {
     }
 
     #[test]
+    fn test_distance_with_legacy_truncated_dimension() {
+        const DIM: usize = 64;
+        const NUM_SUB_VECTORS: usize = 14;
+        const NUM_BITS: u32 = 8;
+        const NUM_CENTROIDS: usize = 1 << NUM_BITS;
+        const SUB_VECTOR_DIM: usize = DIM / NUM_SUB_VECTORS;
+        const PERSISTED_DIM: usize = NUM_SUB_VECTORS * SUB_VECTOR_DIM;
+
+        // Older writers silently omitted the tail when the dimension was not
+        // divisible by the number of sub-vectors. Preserve searches over those
+        // indexes even though current writers reject this configuration.
+        let indexed_vector = (1..=DIM).map(|value| value as f32).collect::<Vec<_>>();
+        let mut codebook = Vec::with_capacity(NUM_SUB_VECTORS * NUM_CENTROIDS * SUB_VECTOR_DIM);
+        for sub_vector in indexed_vector[..PERSISTED_DIM]
+            .as_chunks::<SUB_VECTOR_DIM>()
+            .0
+        {
+            for _ in 0..NUM_CENTROIDS {
+                codebook.extend_from_slice(sub_vector);
+            }
+        }
+        let query = indexed_vector
+            .iter()
+            .enumerate()
+            .map(|(idx, value)| value + if idx < PERSISTED_DIM { 1.0 } else { 1_000.0 })
+            .collect::<Vec<_>>();
+        let code = UInt8Array::from(vec![0; NUM_SUB_VECTORS]);
+
+        let prepared_l2 = ProductQuantizer::new(
+            NUM_SUB_VECTORS,
+            NUM_BITS,
+            DIM,
+            FixedSizeListArray::try_new_from_values(
+                Float32Array::from(codebook.clone()),
+                DIM as i32,
+            )
+            .unwrap(),
+            DistanceType::L2,
+        );
+        assert!(prepared_l2.l2_targets.is_some());
+        let distances = prepared_l2
+            .compute_distances(&Float32Array::from(query.clone()), &code)
+            .unwrap();
+        assert_relative_eq!(distances.value(0), PERSISTED_DIM as f32, epsilon = 1e-4);
+
+        let generic_l2 = ProductQuantizer::new(
+            NUM_SUB_VECTORS,
+            NUM_BITS,
+            DIM,
+            FixedSizeListArray::try_new_from_values(
+                PrimitiveArray::<datatypes::Float64Type>::from(
+                    codebook
+                        .iter()
+                        .map(|value| *value as f64)
+                        .collect::<Vec<_>>(),
+                ),
+                DIM as i32,
+            )
+            .unwrap(),
+            DistanceType::L2,
+        );
+        assert!(generic_l2.l2_targets.is_none());
+        let distances = generic_l2
+            .compute_distances(
+                &PrimitiveArray::<datatypes::Float64Type>::from(
+                    query.iter().map(|value| *value as f64).collect::<Vec<_>>(),
+                ),
+                &code,
+            )
+            .unwrap();
+        assert_relative_eq!(distances.value(0), PERSISTED_DIM as f32, epsilon = 1e-4);
+
+        let dot = ProductQuantizer::new(
+            NUM_SUB_VECTORS,
+            NUM_BITS,
+            DIM,
+            FixedSizeListArray::try_new_from_values(Float32Array::from(codebook), DIM as i32)
+                .unwrap(),
+            DistanceType::Dot,
+        );
+        let expected_dot_distance = 1.0
+            - indexed_vector[..PERSISTED_DIM]
+                .iter()
+                .zip(&query[..PERSISTED_DIM])
+                .map(|(left, right)| left * right)
+                .sum::<f32>();
+        let distances = dot
+            .compute_distances(&Float32Array::from(query), &code)
+            .unwrap();
+        assert_relative_eq!(distances.value(0), expected_dot_distance, epsilon = 1e-4);
+    }
+
+    #[test]
     fn test_pq_transform() {
         const DIM: usize = 16;
         const TOTAL: usize = 64;
@@ -708,16 +848,23 @@ mod tests {
         let pq_code = pq.quantize(&fsl).unwrap();
 
         let mut expected = Vec::with_capacity(TOTAL * 4);
-        vectors.values().chunks_exact(DIM).for_each(|vec| {
-            vec.chunks_exact(DIM / 4)
-                .enumerate()
-                .for_each(|(sub_idx, sub_vec)| {
-                    let centroids = pq.centroids::<datatypes::Float32Type>(sub_idx);
-                    let dists = l2_distance_batch(sub_vec, centroids, DIM / 4);
-                    let code = argmin(dists).unwrap() as u8;
-                    expected.push(code);
-                });
-        });
+        vectors
+            .values()
+            .as_chunks::<DIM>()
+            .0
+            .iter()
+            .for_each(|vec| {
+                vec.as_chunks::<{ DIM / 4 }>()
+                    .0
+                    .iter()
+                    .enumerate()
+                    .for_each(|(sub_idx, sub_vec)| {
+                        let centroids = pq.centroids::<datatypes::Float32Type>(sub_idx);
+                        let dists = l2_distance_batch(sub_vec, centroids, DIM / 4);
+                        let code = argmin(dists).unwrap() as u8;
+                        expected.push(code);
+                    });
+            });
 
         assert_eq!(pq_code.len(), TOTAL);
         assert_eq!(
@@ -727,6 +874,53 @@ mod tests {
                 .values()
                 .as_primitive::<UInt8Type>()
                 .values()
+        );
+    }
+
+    /// A caller-supplied codebook is sliced by column-derived arithmetic, so a
+    /// size that disagrees with the column has to be rejected here: oversized
+    /// would read the sub-vector boundaries at the wrong offsets and train a
+    /// garbage index, undersized would slice out of bounds and panic.
+    #[test]
+    fn test_validate_supplied_codebook() {
+        const DIM: usize = 128;
+        const NUM_SUB_VECTORS: usize = 8;
+        let expected = 256 * DIM;
+
+        validate_supplied_codebook(expected, DIM, NUM_SUB_VECTORS, 8).unwrap();
+        validate_supplied_codebook(16 * DIM, DIM, NUM_SUB_VECTORS, 4).unwrap();
+
+        let error = validate_supplied_codebook(expected * 2, DIM, NUM_SUB_VECTORS, 8).unwrap_err();
+        assert!(
+            matches!(error, Error::InvalidInput { .. }),
+            "expected InvalidInput, got {error:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains(&(expected * 2).to_string())
+                && message.contains(&expected.to_string()),
+            "the error must give both the supplied and the required size: {message}"
+        );
+
+        let error = validate_supplied_codebook(expected / 2, DIM, NUM_SUB_VECTORS, 8).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+
+        let error = validate_supplied_codebook(expected, DIM, 5, 8).unwrap_err();
+        assert!(
+            error.to_string().contains("divisible by num_sub_vectors"),
+            "a dimension that does not divide by num_sub_vectors must say so: {error}"
+        );
+
+        let error = validate_supplied_codebook(DIM, DIM, NUM_SUB_VECTORS, 0).unwrap_err();
+        assert!(
+            error.to_string().contains("not representable"),
+            "num_bits 0 must be rejected rather than accepting one centroid: {error}"
+        );
+
+        let error = validate_supplied_codebook(expected, DIM, NUM_SUB_VECTORS, 1024).unwrap_err();
+        assert!(
+            error.to_string().contains("not representable"),
+            "an absurd num_bits must be reported rather than wrapping: {error}"
         );
     }
 }

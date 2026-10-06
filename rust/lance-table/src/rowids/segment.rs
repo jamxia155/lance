@@ -3,8 +3,15 @@
 
 use std::ops::{Range, RangeInclusive};
 
-use super::{bitmap::Bitmap, encoded_array::EncodedU64Array};
-use deepsize::DeepSizeOf;
+use super::{bitmap::Bitmap, encoded_array::EncodedU64Array, runs::HoleRuns};
+use lance_core::deepsize::DeepSizeOf;
+
+/// Convert an estimated serialized byte cost from `u128` to `usize`, saturating
+/// at [`usize::MAX`] when the value does not fit (infeasible encodings).
+#[inline]
+fn u128_byte_cost_to_usize(v: u128) -> usize {
+    usize::try_from(v).unwrap_or(usize::MAX)
+}
 
 /// Different ways to represent a sequence of distinct u64s.
 ///
@@ -54,6 +61,18 @@ pub enum U64Segment {
     /// Total size: 24 bytes + ceil((max - min) / 8) bytes
     /// Use when: max - min > 16 * len
     RangeWithBitmap { range: Range<u64>, bitmap: Bitmap },
+    /// Two or more sorted, disjoint ranges of row ids, held compactly.
+    ///
+    /// This is how a run of consecutive `Range` segments is kept in memory:
+    /// on the wire it is exactly those `Range` segments, so it needs no format
+    /// support (see `read_row_ids` in `serde`). In memory it is two
+    /// `u32` per range plus prefix sums, and lookups are a binary search,
+    /// where separate segments would cost a heap enum each and linear scans.
+    ///
+    /// Total size on the wire: ~16 bytes per range.
+    /// Use when: fewer than one range per 128 slots, and only for tables that
+    /// opted in (see [`Self::as_ranges`]); `from_slice` never picks it.
+    Ranges { range: Range<u64>, runs: HoleRuns },
     /// A sorted array of row ids, that is sparse.
     ///
     /// Total size: 24 bytes + 2 * n_values bytes
@@ -63,11 +82,12 @@ pub enum U64Segment {
 }
 
 impl DeepSizeOf for U64Segment {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         match self {
             Self::Range(_) => 0,
             Self::RangeWithHoles { holes, .. } => holes.deep_size_of_children(context),
             Self::RangeWithBitmap { bitmap, .. } => bitmap.deep_size_of_children(context),
+            Self::Ranges { runs, .. } => runs.deep_size_of_children(context),
             Self::SortedArray(array) => array.deep_size_of_children(context),
             Self::Array(array) => array.deep_size_of_children(context),
         }
@@ -88,13 +108,17 @@ struct SegmentStats {
 }
 
 impl SegmentStats {
-    fn n_holes(&self) -> u64 {
+    /// Number of missing values ("holes") in the range `[min, max]`.
+    ///
+    /// Returns `u128` because the total slot count `max - min + 1` can be up
+    /// to `2^64` (when `min = 0, max = u64::MAX`), which exceeds `u64::MAX`.
+    fn n_holes(&self) -> u128 {
         debug_assert!(self.sorted);
         if self.count == 0 {
             0
         } else {
-            let total_slots = self.max - self.min + 1;
-            total_slots - self.count
+            let total_slots = self.max as u128 - self.min as u128 + 1;
+            total_slots - self.count as u128
         }
     }
 }
@@ -149,15 +173,24 @@ impl U64Segment {
         }
     }
 
+    /// Estimate the serialized byte size of each sorted encoding variant.
+    ///
+    /// All arithmetic is performed in `u128` to avoid overflow when the range
+    /// span `max - min + 1` approaches or exceeds `2^64`. Infeasible sizes
+    /// saturate to `usize::MAX` so they always lose the `min()` comparison.
     fn sorted_sequence_sizes(stats: &SegmentStats) -> [usize; 3] {
         let n_holes = stats.n_holes();
-        let total_slots = stats.max - stats.min + 1;
+        let total_slots = stats.max as u128 - stats.min as u128 + 1;
 
-        let range_with_holes = 24 + 4 * n_holes as usize;
-        let range_with_bitmap = 24 + (total_slots as f64 / 8.0).ceil() as usize;
-        let sorted_array = 24 + 2 * stats.count as usize;
+        let range_with_holes = 24u128.saturating_add(4u128.saturating_mul(n_holes));
+        let range_with_bitmap = 24u128.saturating_add(total_slots.div_ceil(8));
+        let sorted_array = 24u128.saturating_add(2u128.saturating_mul(stats.count as u128));
 
-        [range_with_holes, range_with_bitmap, sorted_array]
+        [
+            u128_byte_cost_to_usize(range_with_holes),
+            u128_byte_cost_to_usize(range_with_bitmap),
+            u128_byte_cost_to_usize(sorted_array),
+        ]
     }
 
     fn from_stats_and_sequence(
@@ -166,44 +199,94 @@ impl U64Segment {
     ) -> Self {
         if stats.sorted {
             let n_holes = stats.n_holes();
+            // Range-backed encodings store an exclusive end as `Range<u64>`,
+            // which cannot represent `u64::MAX + 1`. Compute the end once and
+            // gate all range-backed branches on its representability.
+            let exclusive_end = stats.max.checked_add(1);
             if stats.count == 0 {
                 Self::Range(0..0)
-            } else if n_holes == 0 {
-                Self::Range(stats.min..(stats.max + 1))
-            } else {
+            } else if n_holes == 0 && exclusive_end.is_some() {
+                Self::Range(stats.min..exclusive_end.unwrap())
+            } else if let Some(end) = exclusive_end {
                 let sizes = Self::sorted_sequence_sizes(&stats);
                 let min_size = sizes.iter().min().unwrap();
                 if min_size == &sizes[0] {
-                    let range = stats.min..(stats.max + 1);
+                    let range = stats.min..end;
                     let mut holes =
                         Self::holes_in_slice(stats.min..=stats.max, sequence).collect::<Vec<_>>();
                     holes.sort_unstable();
                     let holes = EncodedU64Array::from(holes);
-
                     Self::RangeWithHoles { range, holes }
                 } else if min_size == &sizes[1] {
-                    let range = stats.min..(stats.max + 1);
+                    let range = stats.min..end;
                     let mut bitmap = Bitmap::new_full((stats.max - stats.min) as usize + 1);
-
                     for hole in Self::holes_in_slice(stats.min..=stats.max, sequence) {
                         let offset = (hole - stats.min) as usize;
                         bitmap.clear(offset);
                     }
-
                     Self::RangeWithBitmap { range, bitmap }
                 } else {
-                    // Must use array, but at least it's sorted
                     Self::SortedArray(EncodedU64Array::from_iter(sequence))
                 }
+            } else {
+                // max == u64::MAX: exclusive end is unrepresentable in Range<u64>,
+                // so no range-backed encoding can be used.
+                Self::SortedArray(EncodedU64Array::from_iter(sequence))
             }
         } else {
-            // Must use array
             Self::Array(EncodedU64Array::from_iter(sequence))
         }
     }
 
     pub fn from_slice(slice: &[u64]) -> Self {
         Self::from_iter(slice.iter().copied())
+    }
+
+    /// Two or more sorted, disjoint, non-adjacent ranges as one [`Self::Ranges`]
+    /// segment; `None` for fewer ranges or a span that does not fit `u32`.
+    pub fn from_sorted_ranges(ranges: &[Range<u64>]) -> Option<Self> {
+        let [first, .., last] = ranges else {
+            return None;
+        };
+        let base = first.start;
+        let span = u32::try_from(last.end - base).ok()?;
+        let hole_starts = ranges[..ranges.len() - 1]
+            .iter()
+            .map(|range| (range.end - base) as u32)
+            .collect();
+        let hole_ends = ranges[1..]
+            .iter()
+            .map(|range| (range.start - base) as u32)
+            .collect();
+        let runs = HoleRuns::try_new(span, hole_starts, hole_ends).ok()?;
+        Some(Self::Ranges {
+            range: base..last.end,
+            runs,
+        })
+    }
+
+    /// The same values as a run of ranges, when writing them as `Range`
+    /// segments is smaller than the current encoding; `None` when it is not
+    /// (or the span does not fit the compact form's 32-bit offsets).
+    ///
+    /// A `Range` segment costs about 16 bytes on the wire, so ranges beat a
+    /// bitmap when there is less than one range per 128 slots. Hole arrays
+    /// are small by construction and are left alone.
+    pub fn as_ranges(&self) -> Option<Self> {
+        const RANGE_BYTES: usize = 16;
+        match self {
+            Self::RangeWithBitmap { range, bitmap } => {
+                if bitmap.len() > u32::MAX as usize {
+                    return None;
+                }
+                let runs = HoleRuns::from_bitmap(bitmap);
+                ((runs.num_runs() + 1) * RANGE_BYTES < bitmap.bytes().len()).then(|| Self::Ranges {
+                    range: range.clone(),
+                    runs,
+                })
+            }
+            _ => None,
+        }
     }
 }
 
@@ -233,6 +316,12 @@ impl U64Segment {
                     bitmap.get(offset)
                 }))
             }
+            Self::Ranges { range, runs } => {
+                let start = range.start;
+                Box::new(runs.present_ranges().flat_map(move |offsets| {
+                    (start + offsets.start as u64)..(start + offsets.end as u64)
+                }))
+            }
             Self::SortedArray(array) => Box::new(array.iter()),
             Self::Array(array) => Box::new(array.iter()),
         }
@@ -242,16 +331,26 @@ impl U64Segment {
         match self {
             Self::Range(range) => (range.end - range.start) as usize,
             Self::RangeWithHoles { range, holes } => {
-                let holes = holes.iter().count();
-                (range.end - range.start) as usize - holes
+                (range.end - range.start) as usize - holes.len()
             }
             Self::RangeWithBitmap { range, bitmap } => {
                 let holes = bitmap.count_zeros();
                 (range.end - range.start) as usize - holes
             }
+            Self::Ranges { runs, .. } => runs.present_len() as usize,
             Self::SortedArray(array) => array.len(),
             Self::Array(array) => array.len(),
         }
+    }
+
+    pub(crate) fn use_dense_range_expansion(&self, segment_len: usize) -> bool {
+        let Self::RangeWithBitmap { bitmap, .. } = self else {
+            return false;
+        };
+        // Keep sparse segments on the compact per-bit decoder. Contiguous-run
+        // expansion pays off when dense bytes dominate the segment.
+        let dense_threshold = bitmap.len().saturating_sub(bitmap.len() / 4);
+        segment_len >= dense_threshold
     }
 
     pub fn is_empty(&self) -> bool {
@@ -259,23 +358,20 @@ impl U64Segment {
     }
 
     /// Get the min and max value of the segment, excluding tombstones.
+    ///
+    /// Returns `None` for an empty segment, which has no extrema. Decoding accepts an
+    /// empty encoding of every variant, so no arm here may assume it holds a value.
     pub fn range(&self) -> Option<RangeInclusive<u64>> {
         match self {
-            Self::Range(range) if range.is_empty() => None,
             Self::Range(range)
             | Self::RangeWithBitmap { range, .. }
-            | Self::RangeWithHoles { range, .. } => Some(range.start..=(range.end - 1)),
-            Self::SortedArray(array) => {
-                // We can assume that the array is sorted.
-                let min_value = array.first().unwrap();
-                let max_value = array.last().unwrap();
-                Some(min_value..=max_value)
+            | Self::Ranges { range, .. }
+            | Self::RangeWithHoles { range, .. } => {
+                (!range.is_empty()).then(|| range.start..=(range.end - 1))
             }
-            Self::Array(array) => {
-                let min_value = array.min().unwrap();
-                let max_value = array.max().unwrap();
-                Some(min_value..=max_value)
-            }
+            // We can assume that the array is sorted.
+            Self::SortedArray(array) => Some(array.first()?..=array.last()?),
+            Self::Array(array) => Some(array.min()?..=array.max()?),
         }
     }
 
@@ -300,13 +396,25 @@ impl U64Segment {
                 }
             }
             Self::RangeWithHoles { range, holes } => {
-                if range.contains(&val) && holes.binary_search(val).is_err() {
-                    let offset = (val - range.start) as usize;
-                    let holes = holes.iter().take_while(|&hole| hole < val).count();
-                    Some(offset - holes)
-                } else {
-                    None
+                if !range.contains(&val) {
+                    return None;
                 }
+                // binary_search returns Err(idx) where idx is the count of holes
+                // strictly less than val (holes are unique and sorted).
+                match holes.binary_search(val) {
+                    Ok(_) => None,
+                    Err(num_holes_before) => {
+                        let offset = (val - range.start) as usize;
+                        Some(offset - num_holes_before)
+                    }
+                }
+            }
+            Self::Ranges { range, runs } => {
+                if !range.contains(&val) {
+                    return None;
+                }
+                runs.position((val - range.start) as u32)
+                    .map(|position| position as usize)
             }
             Self::RangeWithBitmap { range, bitmap } => {
                 if range.contains(&val) && bitmap.get((val - range.start) as usize) {
@@ -328,20 +436,44 @@ impl U64Segment {
                 Some(val) if val < range.end => Some(val),
                 _ => None,
             },
-            Self::RangeWithHoles { range, .. } => {
-                if i >= (range.end - range.start) as usize {
+            Self::RangeWithHoles { range, holes } => {
+                let len = (range.end - range.start) as usize - holes.len();
+                if i >= len {
                     return None;
                 }
-                self.iter().nth(i)
-            }
-            Self::RangeWithBitmap { range, .. } => {
-                if i >= (range.end - range.start) as usize {
-                    return None;
+                // The i-th surviving value v satisfies v = range.start + i + k,
+                // where k = |{h ∈ holes : h < v}|. holes[k] - k is monotone
+                // non-decreasing in k (holes are sorted and unique), so binary
+                // search for the smallest k such that holes[k] - k > range.start + i.
+                let target = range.start + i as u64;
+                let mut lo = 0usize;
+                let mut hi = holes.len();
+                while lo < hi {
+                    let mid = (lo + hi) / 2;
+                    let h = holes.get(mid).unwrap();
+                    if h.saturating_sub(mid as u64) > target {
+                        hi = mid;
+                    } else {
+                        lo = mid + 1;
+                    }
                 }
-                self.iter().nth(i)
+                Some(range.start + i as u64 + lo as u64)
             }
+            Self::RangeWithBitmap { .. } => self.cursor().get(i),
+            Self::Ranges { range, runs } => u32::try_from(i)
+                .ok()
+                .and_then(|position| runs.offset_at(position))
+                .map(|offset| range.start + offset as u64),
             Self::SortedArray(array) => array.get(i),
             Self::Array(array) => array.get(i),
+        }
+    }
+
+    /// Reads values at non-decreasing indices in one pass.
+    pub fn cursor(&self) -> SegmentCursor<'_> {
+        SegmentCursor {
+            segment: self,
+            state: SegmentCursorState::default(),
         }
     }
 
@@ -363,6 +495,9 @@ impl U64Segment {
                 // Check if the bitmap has the value set (not cleared)
                 let idx = (val - range.start) as usize;
                 bitmap.get(idx)
+            }
+            Self::Ranges { range, runs } => {
+                range.contains(&val) && runs.position((val - range.start) as u32).is_some()
             }
             Self::SortedArray(array) => array.binary_search(val).is_ok(),
             Self::Array(array) => array.iter().any(|v| v == val),
@@ -442,6 +577,14 @@ impl U64Segment {
                     range: new_range,
                     bitmap: Bitmap::from(new_bitmap.as_slice()),
                 }
+            }
+            Self::Ranges { range, runs } => {
+                // Rare on the append path; rebuild from the values and let
+                // `from_slice` pick an encoding (the commit re-encodes runs).
+                let current = Self::Ranges { range, runs };
+                let mut values: Vec<u64> = current.iter().collect();
+                values.push(val);
+                Self::from_slice(&values)
             }
             Self::SortedArray(array) => match array {
                 EncodedU64Array::U64(mut vec) => {
@@ -561,6 +704,7 @@ impl U64Segment {
             Self::Range(_) => true,
             Self::RangeWithHoles { .. } => true,
             Self::RangeWithBitmap { .. } => true,
+            Self::Ranges { .. } => true,
             Self::SortedArray(_) => true,
             Self::Array(_) => false,
         };
@@ -602,9 +746,268 @@ impl U64Segment {
     }
 }
 
+/// Segment reader that keeps its scan position across calls.
+pub struct SegmentCursor<'a> {
+    segment: &'a U64Segment,
+    state: SegmentCursorState,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct SegmentCursorState {
+    /// Byte the next select1 scan resumes at.
+    byte_idx: usize,
+    /// Set bits in the bitmap bytes before `byte_idx`.
+    ones_before: usize,
+}
+
+impl SegmentCursor<'_> {
+    /// The value at index `i`. A decreasing index rewinds the scan.
+    pub fn get(&mut self, i: usize) -> Option<u64> {
+        self.state.get(self.segment, i)
+    }
+}
+
+impl SegmentCursorState {
+    /// Append a contiguous range of values while preserving the bitmap scan
+    /// position for the next call.
+    pub(crate) fn extend_range(
+        &mut self,
+        segment: &U64Segment,
+        selection: Range<usize>,
+        values: &mut Vec<u64>,
+    ) {
+        let U64Segment::RangeWithBitmap { range, bitmap } = segment else {
+            match segment {
+                U64Segment::Range(range) => {
+                    let segment_len = (range.end - range.start) as usize;
+                    let end = selection.end.min(segment_len);
+                    if selection.start < end {
+                        values.extend(
+                            (range.start + selection.start as u64)..(range.start + end as u64),
+                        );
+                    }
+                }
+                U64Segment::Ranges { range, runs } => {
+                    // Positions are below the span, which fits u32.
+                    let clamp = |position: usize| position.min(u32::MAX as usize) as u32;
+                    runs.extend_values(
+                        range.start,
+                        clamp(selection.start)..clamp(selection.end),
+                        values,
+                    );
+                }
+                _ => values.extend(selection.filter_map(|index| segment.get(index))),
+            }
+            return;
+        };
+
+        if selection.start < self.ones_before {
+            self.byte_idx = 0;
+            self.ones_before = 0;
+        }
+
+        while let Some(&byte) = bitmap.data.get(self.byte_idx) {
+            let ones = byte.count_ones() as usize;
+            let ones_after_byte = self.ones_before + ones;
+            if selection.start >= ones_after_byte {
+                self.ones_before = ones_after_byte;
+                self.byte_idx += 1;
+                continue;
+            }
+
+            let mut remaining_bits = byte;
+            let mut rank = self.ones_before;
+            while remaining_bits != 0 {
+                if rank >= selection.end {
+                    return;
+                }
+                let bit = remaining_bits.trailing_zeros() as usize;
+                if rank >= selection.start {
+                    values.push(range.start + (self.byte_idx * 8 + bit) as u64);
+                }
+                remaining_bits &= remaining_bits - 1;
+                rank += 1;
+            }
+
+            self.ones_before = ones_after_byte;
+            self.byte_idx += 1;
+            if self.ones_before >= selection.end {
+                return;
+            }
+        }
+    }
+
+    pub(crate) fn extend_dense_range(
+        &mut self,
+        segment: &U64Segment,
+        selection: Range<usize>,
+        values: &mut Vec<u64>,
+    ) {
+        let U64Segment::RangeWithBitmap { range, bitmap } = segment else {
+            self.extend_range(segment, selection, values);
+            return;
+        };
+        if selection.start < self.ones_before {
+            self.byte_idx = 0;
+            self.ones_before = 0;
+        }
+        self.extend_dense_bitmap_range(range.start, bitmap.bytes(), selection, values);
+    }
+
+    #[inline]
+    fn extend_dense_bitmap_range(
+        &mut self,
+        range_start: u64,
+        bitmap_bytes: &[u8],
+        selection: Range<usize>,
+        values: &mut Vec<u64>,
+    ) {
+        while let Some(&byte) = bitmap_bytes.get(self.byte_idx) {
+            let ones = byte.count_ones() as usize;
+            let ones_after_byte = self.ones_before + ones;
+            if selection.start >= ones_after_byte {
+                self.ones_before = ones_after_byte;
+                self.byte_idx += 1;
+                continue;
+            }
+
+            let includes_entire_byte =
+                selection.start <= self.ones_before && selection.end >= ones_after_byte;
+            if includes_entire_byte && ones >= 6 {
+                let byte_start = range_start + (self.byte_idx * 8) as u64;
+                if byte == u8::MAX {
+                    values.extend(byte_start..byte_start + 8);
+                } else {
+                    let mut remaining_bits = byte;
+                    let mut bit_offset = 0_u64;
+                    while remaining_bits != 0 {
+                        let zeros = remaining_bits.trailing_zeros();
+                        remaining_bits >>= zeros;
+                        bit_offset += u64::from(zeros);
+                        let run = remaining_bits.trailing_ones();
+                        values.extend(
+                            (byte_start + bit_offset)..(byte_start + bit_offset + u64::from(run)),
+                        );
+                        remaining_bits >>= run;
+                        bit_offset += u64::from(run);
+                    }
+                }
+                self.ones_before = ones_after_byte;
+                self.byte_idx += 1;
+                if self.ones_before >= selection.end {
+                    return;
+                }
+                continue;
+            }
+
+            let mut remaining_bits = byte;
+            let mut rank = self.ones_before;
+            while remaining_bits != 0 {
+                if rank >= selection.end {
+                    return;
+                }
+                let bit = remaining_bits.trailing_zeros() as usize;
+                if rank >= selection.start {
+                    values.push(range_start + (self.byte_idx * 8 + bit) as u64);
+                }
+                remaining_bits &= remaining_bits - 1;
+                rank += 1;
+            }
+
+            self.ones_before = ones_after_byte;
+            self.byte_idx += 1;
+            if self.ones_before >= selection.end {
+                return;
+            }
+        }
+    }
+
+    /// The value at index `i`. A decreasing index rewinds the scan.
+    pub(crate) fn get(&mut self, segment: &U64Segment, i: usize) -> Option<u64> {
+        let U64Segment::RangeWithBitmap { range, bitmap } = segment else {
+            return segment.get(i);
+        };
+        if i < self.ones_before {
+            self.byte_idx = 0;
+            self.ones_before = 0;
+        }
+        // Deserialization rejects a bitmap whose padding bits are set, so
+        // popcount counts only valid positions.
+        let mut remaining = i - self.ones_before;
+        let range_start = range.start;
+        let bitmap_bytes = bitmap.bytes();
+        while let Some(&byte) = bitmap_bytes.get(self.byte_idx) {
+            let ones = byte.count_ones() as usize;
+            if remaining < ones {
+                let mut b = byte;
+                for _ in 0..remaining {
+                    b &= b - 1; // clear lowest set bit
+                }
+                let bit = b.trailing_zeros() as usize;
+                return Some(range_start + (self.byte_idx * 8 + bit) as u64);
+            }
+            remaining -= ones;
+            self.ones_before += ones;
+            self.byte_idx += 1;
+        }
+        None
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn test_range_with_bitmap_data_remains_publicly_mutable() {
+        let mut segment = U64Segment::RangeWithBitmap {
+            range: 0..8,
+            bitmap: Bitmap::new_empty(8),
+        };
+        let U64Segment::RangeWithBitmap { bitmap, .. } = &mut segment else {
+            unreachable!();
+        };
+
+        bitmap.data[0] = 0b1010_0101;
+        assert_eq!(bitmap.len, 8);
+        assert_eq!(bitmap.count_ones(), 4);
+    }
+
+    #[test]
+    fn test_extend_range_over_full_and_near_dense_bitmap_bytes() {
+        let mut bitmap = Bitmap::new_full(24);
+        bitmap.clear(10);
+        bitmap.clear(17);
+        bitmap.clear(22);
+        let segment = U64Segment::RangeWithBitmap {
+            range: 100..124,
+            bitmap,
+        };
+        assert!(segment.use_dense_range_expansion(segment.len()));
+
+        let mut sparse_bitmap = Bitmap::new_empty(24);
+        for i in [0, 8, 16] {
+            sparse_bitmap.set(i);
+        }
+        let sparse_segment = U64Segment::RangeWithBitmap {
+            range: 0..24,
+            bitmap: sparse_bitmap,
+        };
+        assert!(!sparse_segment.use_dense_range_expansion(sparse_segment.len()));
+        let expected = segment.iter().collect::<Vec<_>>();
+
+        let mut state = SegmentCursorState::default();
+        let mut actual = Vec::new();
+        for selection in [0..8, 8..15, 15..21] {
+            state.extend_dense_range(&segment, selection, &mut actual);
+        }
+        assert_eq!(actual, expected);
+
+        let mut state = SegmentCursorState::default();
+        let mut partial = Vec::new();
+        state.extend_dense_range(&segment, 9..20, &mut partial);
+        assert_eq!(partial, expected[9..20]);
+    }
 
     #[test]
     fn test_segments() {
@@ -705,6 +1108,189 @@ mod test {
             &[7000, 1, 24000],
             &U64Segment::Array(vec![7000, 1, 24000].into()),
         );
+    }
+
+    /// Decoding accepts an empty encoding of every variant, so `range()` must report the
+    /// absence of extrema for all of them rather than unwrapping a value or computing
+    /// `end - 1` on a zero-length range.
+    #[test]
+    fn test_empty_segments_have_no_range() {
+        let empty: Vec<u64> = Vec::new();
+        let segments = [
+            U64Segment::Range(5..5),
+            U64Segment::RangeWithHoles {
+                range: 0..0,
+                holes: empty.clone().into(),
+            },
+            U64Segment::RangeWithBitmap {
+                range: 0..0,
+                bitmap: Bitmap::new_empty(0),
+            },
+            U64Segment::SortedArray(empty.clone().into()),
+            U64Segment::Array(empty.into()),
+        ];
+        for segment in segments {
+            assert_eq!(segment.range(), None, "{segment:?} should have no range");
+        }
+    }
+
+    #[test]
+    fn test_segment_overflow_boundary() {
+        // Sparse range spanning i64::MAX — the original overflow reproducer.
+        // n_holes ≈ 2^63, which overflows `4 * n_holes as usize` without u128 arithmetic.
+        let values: Vec<u64> = vec![0, 1, 2, 100, i64::MAX as u64];
+        let segment = U64Segment::from_slice(&values);
+        assert!(
+            matches!(segment, U64Segment::SortedArray(_)),
+            "sparse range spanning i64::MAX should be SortedArray, got {:?}",
+            std::mem::discriminant(&segment)
+        );
+        assert_eq!(segment.len(), 5);
+        assert_eq!(segment.iter().collect::<Vec<_>>(), values);
+
+        // Two values at u64 extremes — triggers n_holes() total_slots overflow
+        // (u64::MAX - 0 + 1 wraps to 0 without u128).
+        let values: Vec<u64> = vec![0, u64::MAX];
+        let segment = U64Segment::from_slice(&values);
+        assert!(
+            matches!(segment, U64Segment::SortedArray(_)),
+            "full u64 span should be SortedArray, got {:?}",
+            std::mem::discriminant(&segment)
+        );
+        assert_eq!(segment.len(), 2);
+        assert_eq!(segment.iter().collect::<Vec<_>>(), values);
+
+        // Small dense set near u64::MAX — cost estimation correctly prefers a
+        // range-backed encoding, but Range<u64> cannot represent u64::MAX + 1
+        // as the exclusive end. Must fall back to SortedArray.
+        let values: Vec<u64> = vec![u64::MAX - 3, u64::MAX - 1, u64::MAX];
+        let segment = U64Segment::from_slice(&values);
+        assert!(
+            matches!(segment, U64Segment::SortedArray(_)),
+            "dense set near u64::MAX should be SortedArray (exclusive end unrepresentable), got {:?}",
+            std::mem::discriminant(&segment)
+        );
+        assert_eq!(segment.len(), 3);
+        assert_eq!(segment.iter().collect::<Vec<_>>(), values);
+
+        // Single value at u64::MAX — contiguous range with n_holes == 0, but
+        // exclusive end u64::MAX + 1 overflows.
+        let values: Vec<u64> = vec![u64::MAX];
+        let segment = U64Segment::from_slice(&values);
+        assert!(
+            matches!(segment, U64Segment::SortedArray(_)),
+            "single u64::MAX should be SortedArray, got {:?}",
+            std::mem::discriminant(&segment)
+        );
+        assert_eq!(segment.len(), 1);
+        assert_eq!(segment.iter().collect::<Vec<_>>(), values);
+
+        // Contiguous range ending just below u64::MAX — exclusive end is
+        // representable, so Range encoding should still be used.
+        let values: Vec<u64> = vec![u64::MAX - 3, u64::MAX - 2, u64::MAX - 1];
+        let segment = U64Segment::from_slice(&values);
+        assert_eq!(segment, U64Segment::Range((u64::MAX - 3)..u64::MAX));
+        assert_eq!(segment.len(), 3);
+        assert_eq!(segment.iter().collect::<Vec<_>>(), values);
+
+        // Regression: normal dense range with few holes still picks RangeWithHoles.
+        // Needs total_slots > 32 * n_holes for RangeWithHoles to beat RangeWithBitmap.
+        let values: Vec<u64> = (100..1100).filter(|&x| x != 500).collect();
+        let segment = U64Segment::from_slice(&values);
+        assert_eq!(
+            segment,
+            U64Segment::RangeWithHoles {
+                range: 100..1100,
+                holes: vec![500].into(),
+            }
+        );
+        assert_eq!(segment.len(), 999);
+        assert_eq!(segment.iter().collect::<Vec<_>>(), values);
+
+        // Regression: small dense range with hole picks RangeWithBitmap.
+        let values: Vec<u64> = vec![100, 101, 102, 103, 105];
+        let segment = U64Segment::from_slice(&values);
+        assert!(
+            matches!(segment, U64Segment::RangeWithBitmap { .. }),
+            "small dense range with hole should be RangeWithBitmap, got {:?}",
+            std::mem::discriminant(&segment)
+        );
+        assert_eq!(segment.len(), 5);
+        assert_eq!(segment.iter().collect::<Vec<_>>(), values);
+    }
+
+    #[test]
+    fn test_range_with_holes_len_counts_holes_without_iterating() {
+        // Many holes: `len` must equal the range span minus the hole count and
+        // agree with the iterator, for every hole encoding width.
+        let holes: Vec<u64> = (0..50_000_u64).map(|i| 3 * i + 1).collect();
+        let segment = U64Segment::RangeWithHoles {
+            range: 0..150_000,
+            holes: holes.clone().into(),
+        };
+        assert_eq!(segment.len(), 150_000 - holes.len());
+        assert_eq!(segment.len(), segment.iter().count());
+
+        let wide_holes: Vec<u64> = vec![1 << 40, (1 << 40) + 7];
+        let wide = U64Segment::RangeWithHoles {
+            range: (1 << 40)..((1 << 40) + 10),
+            holes: wide_holes.into(),
+        };
+        assert_eq!(wide.len(), 8);
+        assert_eq!(wide.len(), wide.iter().count());
+    }
+
+    #[test]
+    fn test_u128_byte_cost_to_usize() {
+        assert_eq!(super::u128_byte_cost_to_usize(0), 0);
+        assert_eq!(super::u128_byte_cost_to_usize(42), 42);
+        assert_eq!(
+            super::u128_byte_cost_to_usize(usize::MAX as u128),
+            usize::MAX
+        );
+        assert_eq!(super::u128_byte_cost_to_usize(u128::MAX), usize::MAX);
+    }
+
+    #[test]
+    fn test_sorted_sequence_sizes_sparse_span_saturates_range_with_holes_cost() {
+        let stats = super::SegmentStats {
+            min: 0,
+            max: i64::MAX as u64,
+            count: 5,
+            sorted: true,
+        };
+        let sizes = U64Segment::sorted_sequence_sizes(&stats);
+        assert_eq!(sizes[0], usize::MAX);
+        assert!(sizes[2] < sizes[0]);
+    }
+
+    #[test]
+    fn test_sorted_sequence_sizes_sorted_array_cost_saturates() {
+        // Nearly full [0, u64::MAX] with one hole: count = u64::MAX, n_holes = 1.
+        // SortedArray cost 24 + 2 * u64::MAX does not fit in usize on 64-bit.
+        let stats = super::SegmentStats {
+            min: 0,
+            max: u64::MAX,
+            count: u64::MAX,
+            sorted: true,
+        };
+        let sizes = U64Segment::sorted_sequence_sizes(&stats);
+        assert_eq!(sizes[2], usize::MAX);
+    }
+
+    #[test]
+    fn test_sorted_sequence_sizes_full_span_bitmap_cost() {
+        // Synthetic stats: full [0, u64::MAX] slot space; exercises `range_with_bitmap`
+        // cost path (always fits in `usize` on 64-bit targets).
+        let stats = super::SegmentStats {
+            min: 0,
+            max: u64::MAX,
+            count: 1,
+            sorted: true,
+        };
+        let sizes = U64Segment::sorted_sequence_sizes(&stats);
+        assert!(sizes[1] < sizes[0]);
+        assert!(sizes[1] < usize::MAX);
     }
 
     #[test]
@@ -941,5 +1527,98 @@ mod test {
             !segment.contains(5),
             "Empty segment should not contain anything"
         );
+    }
+
+    /// Row ids 1000..2000 minus three clusters of holes: dense enough that
+    /// `from_slice` picks a bitmap, clustered enough that runs are smaller.
+    fn clustered_values() -> Vec<u64> {
+        (1000..2000u64)
+            .filter(|v| !(1100..1300).contains(v) && !(1500..1650).contains(v) && *v != 1999)
+            .collect()
+    }
+
+    #[test]
+    fn test_ranges_segment_matches_bitmap_semantics() {
+        let values = clustered_values();
+        let bitmap = U64Segment::from_slice(&values);
+        assert!(matches!(bitmap, U64Segment::RangeWithBitmap { .. }));
+        let runs = bitmap
+            .as_ranges()
+            .expect("three runs are smaller than a 125 byte bitmap");
+        let U64Segment::Ranges { runs: holes, .. } = &runs else {
+            panic!("expected a run-length segment");
+        };
+        assert_eq!(holes.num_runs(), 2);
+
+        assert_eq!(runs.len(), bitmap.len());
+        assert_eq!(runs.range(), bitmap.range());
+        assert_eq!(runs.iter().collect::<Vec<_>>(), values);
+        assert_eq!(
+            runs.iter().rev().collect::<Vec<_>>(),
+            values.iter().rev().copied().collect::<Vec<_>>()
+        );
+        for (position, &value) in values.iter().enumerate() {
+            assert_eq!(runs.position(value), Some(position), "value {value}");
+            assert_eq!(runs.get(position), Some(value), "position {position}");
+            assert!(runs.contains(value));
+        }
+        for missing in [999, 1100, 1250, 1299, 1500, 1649, 1999, 2000, 5000] {
+            assert_eq!(runs.position(missing), None, "missing {missing}");
+            assert!(!runs.contains(missing));
+        }
+        assert_eq!(runs.get(values.len()), None);
+        assert_eq!(
+            runs.slice(95, 20).iter().collect::<Vec<_>>(),
+            values[95..115].to_vec()
+        );
+
+        let deleted = [1000, 1050, 1400];
+        assert_eq!(
+            runs.delete(&deleted).iter().collect::<Vec<_>>(),
+            bitmap.delete(&deleted).iter().collect::<Vec<_>>()
+        );
+        let (mut masked_runs, mut masked_bitmap) = (runs.clone(), bitmap);
+        masked_runs.mask(&[0, 1, 7]);
+        masked_bitmap.mask(&[0, 1, 7]);
+        assert_eq!(
+            masked_runs.iter().collect::<Vec<_>>(),
+            masked_bitmap.iter().collect::<Vec<_>>()
+        );
+
+        // The cursor path streaming readers use.
+        let mut cursor = SegmentCursorState::default();
+        let mut got = Vec::new();
+        cursor.extend_range(&runs, 90..110, &mut got);
+        assert_eq!(got, values[90..110].to_vec());
+        got.clear();
+        cursor.extend_range(&runs, 300..values.len() + 10, &mut got);
+        assert_eq!(got, values[300..].to_vec());
+        assert_eq!(runs.cursor().get(400), Some(values[400]));
+
+        let higher = runs.clone().with_new_high(2500).unwrap();
+        assert_eq!(higher.iter().last(), Some(2500));
+        assert_eq!(higher.len(), values.len() + 1);
+    }
+
+    #[test]
+    fn test_as_ranges_only_when_smaller() {
+        // Alternating holes: one run per two slots, far more than one per 64.
+        let alternating: Vec<u64> = (0..1024u64).filter(|v| v % 2 == 0).collect();
+        let bitmap = U64Segment::from_slice(&alternating);
+        assert!(matches!(bitmap, U64Segment::RangeWithBitmap { .. }));
+        assert_eq!(bitmap.as_ranges(), None);
+
+        assert_eq!(U64Segment::Range(0..10).as_ranges(), None);
+        assert_eq!(
+            U64Segment::SortedArray(vec![1, 1000, 1_000_000].into()).as_ranges(),
+            None
+        );
+
+        // Hole arrays are already small; only bitmaps convert.
+        let holes = U64Segment::RangeWithHoles {
+            range: 0..1000,
+            holes: vec![3, 77, 500].into(),
+        };
+        assert_eq!(holes.as_ranges(), None);
     }
 }

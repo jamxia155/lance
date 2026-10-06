@@ -1,0 +1,100 @@
+# Area labels (A-*) applied by actions/labeler@v5 based on changed paths.
+# See .github/workflows/labeler.yml. Title/body conventional-commit labels are
+# handled separately by srvaroa/labeler via .github/labeler.yml.
+#
+# A PR may carry multiple A-* labels (e.g. a Java + namespace change gets both).
+
+A-java:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "java/**"
+          - "rust/lance-jni/**"
+
+A-namespace:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "rust/lance-namespace*/**"
+
+A-index:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "rust/lance-index/**"
+          - "rust/lance-linalg/**"
+          - "rust/lance-tokenizer/**"
+
+A-encoding:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "rust/lance-encoding/**"
+          - "rust/lance-io/**"
+          - "rust/lance-file/**"
+
+# On-disk format: persisted proto definitions and the format spec docs. Keep the
+# explicit proto lists here in sync. Execution-plan schemas (ann,
+# filtered_read, and table_identifier) are intentionally excluded. Format docs
+# are excluded from A-docs (see below) so format changes get A-format only.
+A-format:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "protos/encodings_v2_0.proto"
+          - "protos/encodings_v2_1.proto"
+          - "protos/file.proto"
+          - "protos/file2.proto"
+          - "protos/index.proto"
+          - "protos/index_old.proto"
+          - "protos/rowids.proto"
+          - "protos/table.proto"
+          - "protos/fragment_metadata.proto"
+          - "protos/transaction.proto"
+          - "docs/src/format/**"
+
+# Drives the format-spec vote gate (.github/workflows/format-vote-gate.yml):
+# any change to persisted proto definitions or the spec docs requires a PMC
+# vote. Execution-only wire schemas such as filtered_read.proto are not format
+# changes. A PMC member waives a trivial edit with the `format-waived` label.
+format-change:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "protos/encodings_v2_0.proto"
+          - "protos/encodings_v2_1.proto"
+          - "protos/file.proto"
+          - "protos/file2.proto"
+          - "protos/index.proto"
+          - "protos/index_old.proto"
+          - "protos/rowids.proto"
+          - "protos/table.proto"
+          - "protos/fragment_metadata.proto"
+          - "protos/transaction.proto"
+          - "docs/src/format/**"
+
+# Lockfiles are intentionally not excluded: a pure dependency bump gets both
+# A-python and A-deps. Over-labeling beats dropping the area signal on PRs that
+# touch python code alongside a lockfile.
+A-python:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "python/**"
+
+# Format spec docs (docs/src/format/**) are excluded so they get A-format only.
+# Caveat: a PR that touches both format docs and other docs in the same change
+# won't get A-docs, since the exclusion applies across all changed files.
+A-docs:
+  - all:
+      - changed-files:
+          - any-glob-to-any-file:
+              - "docs/**"
+          - all-globs-to-all-files:
+              - "!docs/src/format/**"
+
+A-ci:
+  - changed-files:
+      - any-glob-to-any-file:
+          - ".github/**"
+
+A-deps:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "**/Cargo.lock"
+          - "**/uv.lock"
+          - "deny.toml"
+          - "**/pyproject.toml"

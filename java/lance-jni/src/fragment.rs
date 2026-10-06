@@ -4,19 +4,25 @@
 use arrow::array::{RecordBatch, RecordBatchIterator, StructArray};
 use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema, from_ffi_and_data_type};
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
-use arrow_schema::DataType;
-use jni::objects::{JIntArray, JValue, JValueGen};
+use arrow_schema::{DataType, Schema as ArrowSchema};
+use jni::objects::{JByteArray, JIntArray, JValue, JValueGen};
 use jni::{
     JNIEnv,
-    objects::{JObject, JString},
-    sys::{jint, jlong},
+    objects::{JClass, JLongArray, JObject, JString},
+    sys::{jint, jlong, jstring},
 };
 use lance::datatypes::Schema;
-use lance::table::format::{DataFile, DeletionFile, DeletionFileType, Fragment, RowIdMeta};
+use lance::table::format::{
+    DataFile, DeletionFile, DeletionFileType, Fragment, RowDatasetVersionMeta, RowIdMeta,
+};
 use lance_io::utils::CachedFileSize;
+use lance_table::rowids::{RowIdSequence, write_row_ids};
 use std::iter::once;
 
-use lance::dataset::fragment::FileFragment;
+use roaring::RoaringBitmap;
+
+use lance::dataset::NewColumnTransform;
+use lance::dataset::fragment::write::FragmentCreateBuilder;
 use lance::io::ObjectStoreParams;
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_io::object_store::{LanceNamespaceStorageOptionsProvider, StorageOptionsProvider};
@@ -26,10 +32,11 @@ use std::sync::Arc;
 use crate::blocking_dataset::extract_namespace_info;
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
+use crate::session::session_from_handle;
 use crate::traits::{FromJObjectWithEnv, IntoJava, JLance, export_vec, import_vec};
 use crate::utils::extract_storage_options;
 use crate::{
-    RT,
+    block_on,
     blocking_dataset::{BlockingDataset, NATIVE_DATASET},
     traits::FromJString,
     utils::extract_write_params,
@@ -45,6 +52,8 @@ pub(crate) struct FragmentMergeResult {
 pub(crate) struct FragmentUpdateResult {
     updated_fragment: Fragment,
     fields_modified: Vec<u32>,
+    /// Matched row offsets serialized as portable RoaringBitmap bytes.
+    updated_row_offset_bytes: Vec<u8>,
 }
 
 //////////////////
@@ -75,7 +84,7 @@ fn inner_count_rows_native(
             "Fragment not found: {fragment_id}"
         )));
     };
-    let res = RT.block_on(fragment.count_rows(None))?;
+    let res = block_on(fragment.count_rows(None))?;
     Ok(res)
 }
 
@@ -96,10 +105,16 @@ pub extern "system" fn Java_org_lance_Fragment_createWithFfiArray<'local>(
     enable_stable_row_ids: JObject,             // Optional<Boolean>
     data_storage_version: JObject,              // Optional<String>
     storage_options_obj: JObject,               // Map<String, String>
+    base_store_params_obj: JObject,             // Map<String, Map<String, String>>
+    initial_bases: JObject,                     // Optional<List<BasePath>>
+    target_bases: JObject,                      // Optional<List<String>>
     namespace_obj: JObject,                     // LanceNamespace (can be null)
     table_id_obj: JObject,                      // List<String> (can be null)
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
     blob_pack_file_size_threshold: JObject,     // Optional<Long>
+    file_write_options: JObject,                // FileWriteOptions
+    schema_addr: jlong,
+    session_handle: jlong, // Session handle, 0 means no session
 ) -> JObject<'local> {
     ok_or_throw_with_return!(
         env,
@@ -115,10 +130,16 @@ pub extern "system" fn Java_org_lance_Fragment_createWithFfiArray<'local>(
             enable_stable_row_ids,
             data_storage_version,
             storage_options_obj,
+            base_store_params_obj,
+            initial_bases,
+            target_bases,
             namespace_obj,
             table_id_obj,
             allow_external_blob_outside_bases,
             blob_pack_file_size_threshold,
+            file_write_options,
+            schema_addr,
+            session_handle,
         ),
         JObject::default()
     )
@@ -137,10 +158,16 @@ fn inner_create_with_ffi_array<'local>(
     enable_stable_row_ids: JObject,             // Optional<Boolean>
     data_storage_version: JObject,              // Optional<String>
     storage_options_obj: JObject,               // Map<String, String>
+    base_store_params_obj: JObject,             // Map<String, Map<String, String>>
+    initial_bases: JObject,                     // Optional<List<BasePath>>
+    target_bases: JObject,                      // Optional<List<String>>
     namespace_obj: JObject,                     // LanceNamespace (can be null)
     table_id_obj: JObject,                      // List<String> (can be null)
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
     blob_pack_file_size_threshold: JObject,     // Optional<Long>
+    file_write_options: JObject,                // FileWriteOptions
+    schema_addr: jlong,
+    session_handle: jlong, // Session handle, 0 means no session
 ) -> Result<JObject<'local>> {
     let c_array_ptr = arrow_array_addr as *mut FFI_ArrowArray;
     let c_schema_ptr = arrow_schema_addr as *mut FFI_ArrowSchema;
@@ -165,10 +192,16 @@ fn inner_create_with_ffi_array<'local>(
         enable_stable_row_ids,
         data_storage_version,
         storage_options_obj,
+        base_store_params_obj,
+        initial_bases,
+        target_bases,
         namespace_obj,
         table_id_obj,
         allow_external_blob_outside_bases,
         blob_pack_file_size_threshold,
+        file_write_options,
+        schema_addr,
+        session_handle,
         reader,
     )
 }
@@ -186,10 +219,16 @@ pub extern "system" fn Java_org_lance_Fragment_createWithFfiStream<'a>(
     enable_stable_row_ids: JObject,             // Optional<Boolean>
     data_storage_version: JObject,              // Optional<String>
     storage_options_obj: JObject,               // Map<String, String>
+    base_store_params_obj: JObject,             // Map<String, Map<String, String>>
+    initial_bases: JObject,                     // Optional<List<BasePath>>
+    target_bases: JObject,                      // Optional<List<String>>
     namespace_obj: JObject,                     // LanceNamespace (can be null)
     table_id_obj: JObject,                      // List<String> (can be null)
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
     blob_pack_file_size_threshold: JObject,     // Optional<Long>
+    file_write_options: JObject,                // FileWriteOptions
+    schema_addr: jlong,
+    session_handle: jlong, // Session handle, 0 means no session
 ) -> JObject<'a> {
     ok_or_throw_with_return!(
         env,
@@ -204,10 +243,16 @@ pub extern "system" fn Java_org_lance_Fragment_createWithFfiStream<'a>(
             enable_stable_row_ids,
             data_storage_version,
             storage_options_obj,
+            base_store_params_obj,
+            initial_bases,
+            target_bases,
             namespace_obj,
             table_id_obj,
             allow_external_blob_outside_bases,
             blob_pack_file_size_threshold,
+            file_write_options,
+            schema_addr,
+            session_handle,
         ),
         JObject::null()
     )
@@ -225,10 +270,16 @@ fn inner_create_with_ffi_stream<'local>(
     enable_stable_row_ids: JObject,             // Optional<Boolean>
     data_storage_version: JObject,              // Optional<String>
     storage_options_obj: JObject,               // Map<String, String>
+    base_store_params_obj: JObject,             // Map<String, Map<String, String>>
+    initial_bases: JObject,                     // Optional<List<BasePath>>
+    target_bases: JObject,                      // Optional<List<String>>
     namespace_obj: JObject,                     // LanceNamespace (can be null)
     table_id_obj: JObject,                      // List<String> (can be null)
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
     blob_pack_file_size_threshold: JObject,     // Optional<Long>
+    file_write_options: JObject,                // FileWriteOptions
+    schema_addr: jlong,
+    session_handle: jlong, // Session handle, 0 means no session
 ) -> Result<JObject<'local>> {
     let stream_ptr = arrow_array_stream_addr as *mut FFI_ArrowArrayStream;
     let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }?;
@@ -243,10 +294,16 @@ fn inner_create_with_ffi_stream<'local>(
         enable_stable_row_ids,
         data_storage_version,
         storage_options_obj,
+        base_store_params_obj,
+        initial_bases,
+        target_bases,
         namespace_obj,
         table_id_obj,
         allow_external_blob_outside_bases,
         blob_pack_file_size_threshold,
+        file_write_options,
+        schema_addr,
+        session_handle,
         reader,
     )
 }
@@ -262,10 +319,16 @@ fn create_fragment<'a>(
     enable_stable_row_ids: JObject,             // Optional<Boolean>
     data_storage_version: JObject,              // Optional<String>
     storage_options_obj: JObject,               // Map<String, String>
+    base_store_params_obj: JObject,             // Map<String, Map<String, String>>
+    initial_bases: JObject,                     // Optional<List<BasePath>>
+    target_bases: JObject,                      // Optional<List<String>>
     namespace_obj: JObject,                     // LanceNamespace (can be null)
     table_id_obj: JObject,                      // List<String> (can be null)
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
     blob_pack_file_size_threshold: JObject,     // Optional<Long>
+    file_write_options: JObject,                // FileWriteOptions
+    schema_addr: jlong,
+    session_handle: jlong, // Session handle, 0 means no session
     source: impl StreamingWriteSource,
 ) -> Result<JObject<'a>> {
     let path_str = dataset_uri.extract(env)?;
@@ -280,11 +343,15 @@ fn create_fragment<'a>(
         &data_storage_version,
         None,
         &storage_options_obj,
-        &JObject::null(), // not used when creating fragments
-        &JObject::null(), // not used when creating fragments
+        &base_store_params_obj,
+        &initial_bases,
+        &target_bases,
         &allow_external_blob_outside_bases,
         &blob_pack_file_size_threshold,
+        &file_write_options,
     )?;
+
+    write_params.session = session_from_handle(session_handle);
 
     // Set up storage options provider if namespace is provided
     let namespace_info = extract_namespace_info(env, &namespace_obj, &table_id_obj)?;
@@ -312,11 +379,19 @@ fn create_fragment<'a>(
         });
     }
 
-    let fragments = RT.block_on(FileFragment::create_fragments(
-        &path_str,
-        source,
-        Some(write_params),
-    ))?;
+    let mut builder = FragmentCreateBuilder::new(&path_str).write_params(&write_params);
+    let schema;
+    if schema_addr != 0 {
+        let c_schema_ptr = schema_addr as *mut FFI_ArrowSchema;
+        let c_schema = unsafe { FFI_ArrowSchema::from_raw(c_schema_ptr) };
+        let arrow_schema = ArrowSchema::try_from(&c_schema)?;
+        // Schema::try_from restores Lance field IDs from the LANCE_FIELD_ID_KEY
+        // metadata inserted by LanceSchema.asArrowSchemaWithFieldIds().
+        schema = Schema::try_from(&arrow_schema)?;
+        builder = builder.schema(&schema);
+    }
+
+    let fragments = block_on(builder.write_fragments(source))?;
     export_vec(env, &fragments)
 }
 
@@ -358,7 +433,7 @@ fn inner_delete_rows<'local>(
         .map(|x| x as u32)
         .collect();
 
-    let res = RT.block_on(async move { fragment.extend_deletions(indexes).await });
+    let res = block_on(async move { fragment.extend_deletions(indexes).await });
 
     let obj = match res {
         Ok(Some(f)) => f.metadata().into_java(env)?,
@@ -407,13 +482,10 @@ fn inner_merge_column<'local>(
     left_on: JString,
     right_on: JString,
 ) -> Result<JObject<'local>> {
-    let (fragment_opt, max_field_id) = {
+    let fragment_opt = {
         let dataset =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
-        (
-            dataset.inner.get_fragment(fragment_id as usize),
-            dataset.inner.manifest().max_field_id(),
-        )
+        dataset.inner.get_fragment(fragment_id as usize)
     };
     let mut fragment = match fragment_opt {
         Some(fragment) => fragment,
@@ -430,7 +502,7 @@ fn inner_merge_column<'local>(
     let right_on_str: String = right_on.extract(env)?;
 
     let (new_frag, new_schema) =
-        RT.block_on(fragment.merge_columns(reader, &left_on_str, &right_on_str, max_field_id))?;
+        block_on(fragment.merge_columns(reader, &left_on_str, &right_on_str))?;
     let result = FragmentMergeResult {
         fragment: new_frag,
         schema: new_schema,
@@ -487,11 +559,200 @@ fn inner_update_column<'local>(
     let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }?;
     let left_on_str: String = left_on.extract(env)?;
     let right_on_str: String = right_on.extract(env)?;
-    let (updated_fragment, fields_modified) =
-        RT.block_on(fragment.update_columns(reader, &left_on_str, &right_on_str))?;
+    let r = block_on(fragment.update_columns_with_offsets(reader, &left_on_str, &right_on_str))?;
+    let updated_row_offset_bytes = serialize_matched_offsets(&r.matched_offsets)?;
     let result = FragmentUpdateResult {
-        updated_fragment,
-        fields_modified,
+        updated_fragment: r.fragment,
+        fields_modified: r.fields_modified,
+        updated_row_offset_bytes,
+    };
+    result.into_java(env)
+}
+
+fn serialize_matched_offsets(bitmap: &RoaringBitmap) -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    bitmap.serialize_into(&mut buf).map_err(|e| {
+        Error::runtime_error(format!(
+            "failed to serialize matched row offsets RoaringBitmap: {e}"
+        ))
+    })?;
+    Ok(buf)
+}
+
+fn deserialize_row_offset_bytes(bytes: &[u8]) -> Result<RoaringBitmap> {
+    if bytes.is_empty() {
+        return Ok(RoaringBitmap::new());
+    }
+    RoaringBitmap::deserialize_from(bytes).map_err(|e| {
+        Error::input_error(format!(
+            "invalid updatedRowOffsetBytes RoaringBitmap bytes: {e}"
+        ))
+    })
+}
+
+fn expand_row_offset_bytes_to_i64(bitmap: &RoaringBitmap) -> Vec<i64> {
+    bitmap.iter().map(|o| o as i64).collect()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_fragment_FragmentUpdateResult_expandRowOffsetsFromBytes<
+    'local,
+>(
+    mut env: JNIEnv<'local>,
+    _cls: JClass,
+    jbytes: JByteArray,
+) -> JLongArray<'local> {
+    ok_or_throw_with_return!(
+        env,
+        inner_expand_updated_row_offset_bytes(&mut env, jbytes),
+        unsafe { JLongArray::from_raw(std::ptr::null_mut()) }
+    )
+}
+
+fn inner_expand_updated_row_offset_bytes<'local>(
+    env: &mut JNIEnv<'local>,
+    jbytes: JByteArray,
+) -> Result<JLongArray<'local>> {
+    let buf = env.convert_byte_array(&jbytes)?;
+    let bitmap = deserialize_row_offset_bytes(&buf)?;
+    let offsets = expand_row_offset_bytes_to_i64(&bitmap);
+    let arr = env.new_long_array(offsets.len() as i32)?;
+    if !offsets.is_empty() {
+        env.set_long_array_region(&arr, 0, &offsets)?;
+    }
+    Ok(arr)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_fragment_FragmentUpdateResult_encodeRowOffsetsToBytes<
+    'local,
+>(
+    mut env: JNIEnv<'local>,
+    _cls: JClass,
+    joffsets: JLongArray,
+) -> JByteArray<'local> {
+    ok_or_throw_with_return!(
+        env,
+        inner_encode_updated_row_offset_bytes(&mut env, joffsets),
+        unsafe { JByteArray::from_raw(std::ptr::null_mut()) }
+    )
+}
+
+fn inner_encode_updated_row_offset_bytes<'local>(
+    env: &mut JNIEnv<'local>,
+    joffsets: JLongArray,
+) -> Result<JByteArray<'local>> {
+    let len = env.get_array_length(&joffsets)?;
+    let mut buf: Vec<i64> = vec![0; len as usize];
+    if len > 0 {
+        env.get_long_array_region(&joffsets, 0, buf.as_mut_slice())?;
+    }
+    let mut bitmap = RoaringBitmap::new();
+    for offset in buf {
+        if offset < 0 {
+            return Err(Error::input_error(format!(
+                "updatedRowOffsets must be non-negative, got {offset}"
+            )));
+        }
+        if offset > u32::MAX as i64 {
+            return Err(Error::input_error(format!(
+                "updatedRowOffsets value {offset} exceeds u32::MAX"
+            )));
+        }
+        bitmap.insert(offset as u32);
+    }
+    let bytes = serialize_matched_offsets(&bitmap)?;
+    Ok(env.byte_array_from_slice(&bytes)?)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_fragment_RowIdMeta_nativeEncodeRowIds(
+    mut env: JNIEnv,
+    _cls: JClass,
+    row_ids: JLongArray,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        inner_encode_row_ids(&mut env, &row_ids)
+            .and_then(|json| env.new_string(json).map_err(Error::from)),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+fn inner_encode_row_ids(env: &mut JNIEnv, row_ids: &JLongArray) -> Result<String> {
+    let len = env.get_array_length(row_ids)?;
+    let mut buf: Vec<i64> = vec![0; len as usize];
+    env.get_long_array_region(row_ids, 0, buf.as_mut_slice())?;
+    let ids: Vec<u64> = buf.into_iter().map(|x| x as u64).collect();
+    let seq = RowIdSequence::from(ids.as_slice());
+    let meta = RowIdMeta::Inline(write_row_ids(&seq).into());
+    let json = serde_json::to_string(&meta)?;
+    Ok(json)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Fragment_nativeAddColumnsByReader<'a>(
+    mut env: JNIEnv<'a>,
+    _obj: JObject,
+    jdataset: JObject,              // Java DataSet
+    fragment_id: jlong,             // FragmentID
+    arrow_array_stream_addr: jlong, // memoryAddress of ArrowStream
+    batch_size: JObject,            // Optional<Long>
+) -> JObject<'a> {
+    ok_or_throw_with_return!(
+        env,
+        inner_add_columns_by_reader(
+            &mut env,
+            jdataset,
+            fragment_id,
+            arrow_array_stream_addr,
+            batch_size
+        ),
+        JObject::null()
+    )
+}
+
+fn inner_add_columns_by_reader<'local>(
+    env: &mut JNIEnv<'local>,
+    jdataset: JObject,
+    fragment_id: jlong,
+    arrow_array_stream_addr: jlong,
+    batch_size: JObject,
+) -> Result<JObject<'local>> {
+    let fragment_opt = {
+        let dataset =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
+        dataset.inner.get_fragment(fragment_id as usize)
+    };
+    let fragment = match fragment_opt {
+        Some(fragment) => fragment,
+        None => {
+            return Err(Error::input_error(format!(
+                "Fragment not found: {fragment_id}"
+            )));
+        }
+    };
+
+    let stream_ptr = arrow_array_stream_addr as *mut FFI_ArrowArrayStream;
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }?;
+    let batch_size = match env.get_long_opt(&batch_size)? {
+        Some(value) => Some(
+            value
+                .try_into()
+                .map_err(|_| Error::input_error(format!("Invalid batch size: {value}")))?,
+        ),
+        None => None,
+    };
+
+    let (new_frag, new_schema) = block_on(fragment.add_columns(
+        NewColumnTransform::Reader(Box::new(reader)),
+        None,
+        batch_size,
+    ))?;
+    let result = FragmentMergeResult {
+        fragment: new_frag,
+        schema: new_schema,
     };
     result.into_java(env)
 }
@@ -504,14 +765,16 @@ const DELETE_FILE_CONSTRUCTOR_SIG: &str =
     "(JJLjava/lang/Long;Lorg/lance/fragment/DeletionFileType;Ljava/lang/Integer;)V";
 const DELETE_FILE_TYPE_CLASS: &str = "org/lance/fragment/DeletionFileType";
 const FRAGMENT_METADATA_CLASS: &str = "org/lance/FragmentMetadata";
-const FRAGMENT_METADATA_CONSTRUCTOR_SIG: &str = "(ILjava/util/List;Ljava/lang/Long;Lorg/lance/fragment/DeletionFile;Lorg/lance/fragment/RowIdMeta;)V";
+const FRAGMENT_METADATA_CONSTRUCTOR_SIG: &str = "(ILjava/util/List;Ljava/lang/Long;Lorg/lance/fragment/DeletionFile;Lorg/lance/fragment/RowIdMeta;Lorg/lance/fragment/VersionMeta;Lorg/lance/fragment/VersionMeta;Ljava/util/List;)V";
 const ROW_ID_META_CLASS: &str = "org/lance/fragment/RowIdMeta";
 const ROW_ID_META_CONSTRUCTOR_SIG: &str = "(Ljava/lang/String;)V";
+const VERSION_META_CLASS: &str = "org/lance/fragment/VersionMeta";
+const VERSION_META_CONSTRUCTOR_SIG: &str = "(Ljava/lang/String;)V";
 const FRAGMENT_MERGE_RESULT_CLASS: &str = "org/lance/fragment/FragmentMergeResult";
 const FRAGMENT_MERGE_RESULT_CONSTRUCTOR_SIG: &str =
     "(Lorg/lance/FragmentMetadata;Lorg/lance/schema/LanceSchema;)V";
 const FRAGMENT_UPDATE_RESULT_CLASS: &str = "org/lance/fragment/FragmentUpdateResult";
-const FRAGMENT_UPDATE_RESULT_CONSTRUCTOR_SIG: &str = "(Lorg/lance/FragmentMetadata;[J)V";
+const FRAGMENT_UPDATE_RESULT_CONSTRUCTOR_SIG: &str = "(Lorg/lance/FragmentMetadata;[J[B)V";
 
 impl IntoJava for &FragmentMergeResult {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
@@ -532,12 +795,15 @@ impl IntoJava for &FragmentUpdateResult {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
         let java_updated_fragment = self.updated_fragment.into_java(env)?;
         let java_fields_modified = JLance(self.fields_modified.clone()).into_java(env)?;
+        let java_updated_row_offset_bytes =
+            env.byte_array_from_slice(&self.updated_row_offset_bytes)?;
         Ok(env.new_object(
             FRAGMENT_UPDATE_RESULT_CLASS,
             FRAGMENT_UPDATE_RESULT_CONSTRUCTOR_SIG,
             &[
                 JValueGen::Object(&java_updated_fragment),
                 JValueGen::Object(&java_fields_modified),
+                JValueGen::Object(&java_updated_row_offset_bytes),
             ],
         )?)
     }
@@ -621,16 +887,41 @@ impl IntoJava for &RowIdMeta {
     }
 }
 
+impl IntoJava for &RowDatasetVersionMeta {
+    fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
+        let json_str = serde_json::to_string(self)?;
+        let json = env.new_string(json_str)?.into();
+        Ok(env.new_object(
+            VERSION_META_CLASS,
+            VERSION_META_CONSTRUCTOR_SIG,
+            &[JValueGen::Object(&json)],
+        )?)
+    }
+}
+
 impl IntoJava for &Fragment {
     fn into_java<'local>(self, env: &mut JNIEnv<'local>) -> Result<JObject<'local>> {
         let files = self.files.clone();
         let files = export_vec::<DataFile>(env, &files)?;
+        let referenced_data_files = self
+            .referenced_lance_files()
+            .cloned()
+            .collect::<Vec<DataFile>>();
+        let referenced_data_files = export_vec::<DataFile>(env, &referenced_data_files)?;
         let deletion_file = match &self.deletion_file {
             Some(f) => f.into_java(env)?,
             None => JObject::null(),
         };
         let physical_rows = &JLance(self.physical_rows).into_java(env)?;
         let row_id_meta = match &self.row_id_meta {
+            Some(m) => m.into_java(env)?,
+            None => JObject::null(),
+        };
+        let created_at = match &self.created_at_version_meta {
+            Some(m) => m.into_java(env)?,
+            None => JObject::null(),
+        };
+        let last_updated_at = match &self.last_updated_at_version_meta {
             Some(m) => m.into_java(env)?,
             None => JObject::null(),
         };
@@ -644,6 +935,9 @@ impl IntoJava for &Fragment {
                 JValueGen::Object(physical_rows),
                 JValueGen::Object(&deletion_file),
                 JValueGen::Object(&row_id_meta),
+                JValueGen::Object(&created_at),
+                JValueGen::Object(&last_updated_at),
+                JValueGen::Object(&referenced_data_files),
             ],
         )
         .map_err(|e| {
@@ -663,6 +957,38 @@ impl FromJObjectWithEnv<RowIdMeta> for JObject<'_> {
     }
 }
 
+impl FromJObjectWithEnv<RowDatasetVersionMeta> for JObject<'_> {
+    fn extract_object(&self, env: &mut JNIEnv<'_>) -> Result<RowDatasetVersionMeta> {
+        let metadata = env
+            .call_method(self, "getMetadata", "()Ljava/lang/String;", &[])?
+            .l()?;
+        let s: String = env.get_string(&JString::from(metadata))?.into();
+        let meta: RowDatasetVersionMeta = serde_json::from_str(&s)?;
+        Ok(meta)
+    }
+}
+
+/// Extract an optional field from a Java object by calling a getter method.
+/// Returns `None` if the getter returns null, otherwise deserializes the JObject.
+fn extract_nullable_field<T>(
+    env: &mut JNIEnv<'_>,
+    obj: &JObject<'_>,
+    method: &str,
+    class: &str,
+) -> Result<Option<T>>
+where
+    for<'a> JObject<'a>: FromJObjectWithEnv<T>,
+{
+    let result = env
+        .call_method(obj, method, format!("()L{};", class), &[])?
+        .l()?;
+    if result.is_null() {
+        Ok(None)
+    } else {
+        Ok(Some(result.extract_object(env)?))
+    }
+}
+
 impl FromJObjectWithEnv<Fragment> for JObject<'_> {
     fn extract_object(&self, env: &mut JNIEnv<'_>) -> Result<Fragment> {
         let id = env.call_method(self, "getId", "()I", &[])?.i()? as u64;
@@ -675,41 +1001,26 @@ impl FromJObjectWithEnv<Fragment> for JObject<'_> {
         for f in file_objs {
             files.push(f.extract_object(env)?);
         }
-        let deletion_file = env
-            .call_method(
-                self,
-                "getDeletionFile",
-                format!("()L{};", DELETE_FILE_CLASS),
-                &[],
-            )?
-            .l()?;
-        let deletion_file = if deletion_file.is_null() {
-            None
-        } else {
-            Some(deletion_file.extract_object(env)?)
-        };
 
-        let row_id_meta = env
-            .call_method(
-                self,
-                "getRowIdMeta",
-                format!("()L{};", ROW_ID_META_CLASS),
-                &[],
-            )?
-            .l()?;
-        let row_id_meta = if row_id_meta.is_null() {
-            None
-        } else {
-            Some(row_id_meta.extract_object(env)?)
-        };
+        let deletion_file =
+            extract_nullable_field(env, self, "getDeletionFile", DELETE_FILE_CLASS)?;
+        let row_id_meta = extract_nullable_field(env, self, "getRowIdMeta", ROW_ID_META_CLASS)?;
+        let created_at_version_meta =
+            extract_nullable_field(env, self, "getCreatedAtVersionMeta", VERSION_META_CLASS)?;
+        let last_updated_at_version_meta =
+            extract_nullable_field(env, self, "getLastUpdatedAtVersionMeta", VERSION_META_CLASS)?;
+
         Ok(Fragment {
             id,
             files,
             deletion_file,
             physical_rows: Some(physical_rows),
             row_id_meta,
-            created_at_version_meta: None,
-            last_updated_at_version_meta: None,
+            created_at_version_meta,
+            last_updated_at_version_meta,
+            // Overlays are not exposed to Java yet, and the reverse conversion
+            // does not export them, so this round-trip is overlay-free.
+            overlays: vec![],
         })
     }
 }

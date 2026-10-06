@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::blob::{PyDedicatedBlobWriter, PyPackedBlobWriter};
 use crate::namespace::extract_namespace_arc;
 use crate::{error::PythonErrorExt, rt};
 use arrow::pyarrow::PyArrowType;
@@ -20,15 +21,15 @@ use arrow_schema::Schema as ArrowSchema;
 use bytes::Bytes;
 use futures::stream::StreamExt;
 use lance::io::{ObjectStore, RecordBatchStream};
+use lance_arrow::json::convert_json_columns;
 use lance_core::cache::LanceCache;
 use lance_core::utils::path::LancePathExt;
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::reader::{
     BufferDescriptor, CachedFileMetadata, FileReader, FileReaderOptions, FileStatistics,
-    ReaderProjection,
 };
 use lance_file::writer::{FileWriter, FileWriterOptions};
-use lance_file::{LanceEncodingsIo, version::LanceFileVersion};
+use lance_file::{LanceEncodingsIo, version::LanceFileVersion, versions as file_versions};
 use lance_io::object_store::{LanceNamespaceStorageOptionsProvider, ObjectStoreParams};
 use lance_io::{
     ReadBatchParams,
@@ -36,7 +37,7 @@ use lance_io::{
     traits::Writer,
     utils::CachedFileSize,
 };
-use object_store::path::Path;
+use object_store::{ObjectStoreExt, path::Path};
 use pyo3::{
     Bound, IntoPyObjectExt, Py, PyErr, PyResult, Python,
     exceptions::{PyIOError, PyRuntimeError},
@@ -48,7 +49,7 @@ use std::collections::HashMap;
 use std::{pin::Pin, sync::Arc};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
-#[pyclass(get_all)]
+#[pyclass(get_all, skip_from_py_object)]
 #[derive(Clone, Debug, Serialize)]
 pub struct LanceBufferDescriptor {
     /// The byte offset of the buffer in the file
@@ -70,7 +71,7 @@ impl LanceBufferDescriptor {
     }
 }
 
-#[pyclass(get_all)]
+#[pyclass(get_all, skip_from_py_object)]
 #[derive(Clone, Debug, Serialize)]
 pub struct LancePageMetadata {
     /// The buffers in the page
@@ -94,7 +95,7 @@ impl LancePageMetadata {
     }
 }
 
-#[pyclass(get_all)]
+#[pyclass(get_all, skip_from_py_object)]
 #[derive(Clone, Debug, Serialize)]
 pub struct LanceColumnMetadata {
     /// The column-wide buffers
@@ -119,7 +120,7 @@ impl LanceColumnMetadata {
 }
 
 /// Statistics summarize some of the file metadata for quick summary info
-#[pyclass(get_all)]
+#[pyclass(get_all, skip_from_py_object)]
 #[derive(Clone, Debug, Serialize)]
 pub struct LanceFileStatistics {
     /// Statistics about each of the columns in the file
@@ -135,7 +136,7 @@ impl LanceFileStatistics {
 }
 
 /// Summary information describing a column
-#[pyclass(get_all)]
+#[pyclass(get_all, skip_from_py_object)]
 #[derive(Clone, Debug, Serialize)]
 pub struct LanceColumnStatistics {
     /// The number of pages in the column
@@ -170,7 +171,7 @@ impl LanceFileStatistics {
     }
 }
 
-#[pyclass(get_all)]
+#[pyclass(get_all, skip_from_py_object)]
 #[derive(Clone, Debug, Serialize)]
 pub struct LanceFileMetadata {
     /// The schema of the file
@@ -229,6 +230,26 @@ impl LanceFileMetadata {
     }
 }
 
+/// Summary of a completed Lance file write
+#[pyclass(get_all, skip_from_py_object)]
+#[derive(Clone, Debug, Serialize)]
+pub struct LanceFileWriteSummary {
+    /// The number of rows written to the file
+    pub num_rows: u64,
+    /// The final size of the file, in bytes
+    pub size_bytes: u64,
+}
+
+#[pymethods]
+impl LanceFileWriteSummary {
+    fn __repr__(&self) -> String {
+        format!(
+            "FileWriteSummary(num_rows={}, size_bytes={})",
+            self.num_rows, self.size_bytes
+        )
+    }
+}
+
 #[pyclass]
 pub struct LanceFileWriter {
     inner: Arc<Mutex<Box<FileWriter>>>,
@@ -274,21 +295,23 @@ impl LanceFileWriter {
         max_page_bytes: Option<u64>,
     ) -> PyResult<Self> {
         let object_writer = object_store.create(&path).await.infer_error()?;
+        let version = version
+            .map(|value| value.parse::<LanceFileVersion>())
+            .transpose()
+            .infer_error()?
+            .unwrap_or_default()
+            .resolve();
         let options = FileWriterOptions {
             data_cache_bytes,
             keep_original_array,
             max_page_bytes,
-            format_version: version
-                .map(|v| v.parse::<LanceFileVersion>())
-                .transpose()
-                .infer_error()?,
-            ..Default::default()
         };
         let inner = if let Some(schema) = schema {
             let lance_schema = lance_core::datatypes::Schema::try_from(&schema.0).infer_error()?;
-            FileWriter::try_new(object_writer, lance_schema, options).infer_error()
+            file_versions::create_writer(version, object_writer, lance_schema, options)
+                .infer_error()
         } else {
-            Ok(FileWriter::new_lazy(object_writer, options))
+            file_versions::create_lazy_writer(version, object_writer, options).infer_error()
         }?;
         Ok(Self {
             inner: Arc::new(Mutex::new(Box::new(inner))),
@@ -340,15 +363,27 @@ impl LanceFileWriter {
     }
 
     pub fn write_batch(&self, batch: PyArrowType<RecordBatch>) -> PyResult<()> {
+        let batch = convert_json_columns(&batch.0)
+            .map_err(lance_core::Error::from)
+            .infer_error()?;
         rt().block_on(None, async {
-            self.inner.lock().await.write_batch(&batch.0).await
+            self.inner.lock().await.write_batch(&batch).await
         })?
         .infer_error()
     }
 
-    pub fn finish(&self) -> PyResult<u64> {
-        rt().block_on(None, async { self.inner.lock().await.finish().await })?
-            .infer_error()
+    /// Finish the file and return the row count and the final file size
+    ///
+    /// The size is reported by the object writer once the file has been closed
+    /// and so it is accurate for object stores as well as local filesystems.
+    pub fn finish(&self) -> PyResult<LanceFileWriteSummary> {
+        let summary = rt()
+            .block_on(None, async { self.inner.lock().await.finish().await })?
+            .infer_error()?;
+        Ok(LanceFileWriteSummary {
+            num_rows: summary.num_rows,
+            size_bytes: summary.size_bytes,
+        })
     }
 
     pub fn add_global_buffer(&self, bytes: Vec<u8>) -> PyResult<u32> {
@@ -522,6 +557,30 @@ impl LanceFileSession {
         )?
     }
 
+    pub fn open_packed_blob_writer(
+        &self,
+        path: String,
+        blob_id: u32,
+    ) -> PyResult<PyPackedBlobWriter> {
+        let path = self.base_path.child_path(&Path::from(path));
+        rt().block_on(
+            None,
+            PyPackedBlobWriter::try_new(self.object_store.clone(), path, blob_id),
+        )?
+    }
+
+    pub fn open_dedicated_blob_writer(
+        &self,
+        path: String,
+        blob_id: u32,
+    ) -> PyResult<PyDedicatedBlobWriter> {
+        let path = self.base_path.child_path(&Path::from(path));
+        rt().block_on(
+            None,
+            PyDedicatedBlobWriter::try_new(self.object_store.clone(), path, blob_id),
+        )?
+    }
+
     pub fn contains(&self, path: String) -> PyResult<bool> {
         let full_path = self.base_path.child_path(&Path::from(path));
         rt().block_on(None, async {
@@ -572,6 +631,57 @@ impl LanceFileSession {
         })?
     }
 
+    /// Non-recursive, delimited list of a single directory level.
+    ///
+    /// Returns a tuple `(common_prefixes, objects)` of paths relative to the
+    /// session's `base_path`, where `common_prefixes` are the immediate child
+    /// "directories" and `objects` are the immediate child files. Unlike
+    /// `list`, this does not recurse into the subtree.
+    #[pyo3(signature=(path=None))]
+    pub fn list_with_delimiter(
+        &self,
+        path: Option<String>,
+    ) -> PyResult<(Vec<String>, Vec<String>)> {
+        rt().block_on(None, async {
+            let list_path = if let Some(prefix) = path {
+                self.base_path.child_path(&Path::from(prefix))
+            } else {
+                self.base_path.clone()
+            };
+
+            let result = self
+                .object_store
+                .list_with_delimiter(Some(&list_path))
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))?;
+
+            // Strip the base_path prefix to make each path relative to the session.
+            let relativize = |location: &Path| -> PyResult<String> {
+                let relative_parts = location.prefix_match(&self.base_path).ok_or_else(|| {
+                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                        "Path '{}' does not start with base path '{}'",
+                        location.as_ref(),
+                        self.base_path.as_ref()
+                    ))
+                })?;
+                Ok(Path::from_iter(relative_parts).as_ref().to_string())
+            };
+
+            let common_prefixes = result
+                .common_prefixes
+                .iter()
+                .map(relativize)
+                .collect::<PyResult<Vec<String>>>()?;
+            let objects = result
+                .objects
+                .iter()
+                .map(|meta| relativize(&meta.location))
+                .collect::<PyResult<Vec<String>>>()?;
+
+            Ok((common_prefixes, objects))
+        })?
+    }
+
     /// Upload a file from local filesystem to the object store
     ///
     /// Parameters
@@ -601,6 +711,61 @@ impl LanceFileSession {
                 .map_err(|e| PyIOError::new_err(format!("Failed to finalize upload: {}", e)))?;
 
             Ok(())
+        })?
+    }
+
+    /// Delete a file from the object store.
+    ///
+    /// The path is interpreted relative to the session's `base_path`, matching
+    /// `contains`/`upload_file`/`download_file`. Deleting a missing object
+    /// raises `OSError`, consistent with `download_file`.
+    ///
+    /// Parameters
+    /// ----------
+    /// path : str
+    ///     Path relative to `base_path` to delete.
+    pub fn delete_file(&self, path: String) -> PyResult<()> {
+        rt().block_on(None, async {
+            let full_path = self.base_path.child_path(&Path::from(path));
+            self.object_store
+                .inner
+                .delete(&full_path)
+                .await
+                .map_err(|e| PyIOError::new_err(format!("Failed to delete remote file: {}", e)))?;
+            Ok(())
+        })?
+    }
+
+    /// Read a byte range from a file in the object store.
+    ///
+    /// The path is interpreted relative to the session's `base_path`, matching
+    /// the other session methods. This issues a single ranged GET. Reading a
+    /// missing object raises `OSError`, consistent with `download_file`.
+    ///
+    /// Parameters
+    /// ----------
+    /// path : str
+    ///     Path relative to `base_path` to read from.
+    /// offset : int
+    ///     Byte offset at which to start reading.
+    /// length : int
+    ///     Number of bytes to read.
+    ///
+    /// Returns
+    /// -------
+    /// bytes
+    ///     The requested byte range.
+    pub fn read_range(&self, path: String, offset: usize, length: usize) -> PyResult<Vec<u8>> {
+        rt().block_on(None, async {
+            let full_path = self.base_path.child_path(&Path::from(path));
+            let bytes = self
+                .object_store
+                .read_one_range(&full_path, offset..offset + length)
+                .await
+                .map_err(|e| {
+                    PyIOError::new_err(format!("Failed to read range from remote file: {}", e))
+                })?;
+            Ok(bytes.to_vec())
         })?
     }
 
@@ -684,7 +849,7 @@ impl LanceFileReader {
         let mut base_projection = None;
         if let Some(columns) = columns {
             base_projection = Some(
-                ReaderProjection::from_column_names(
+                file_versions::reader_projection_from_column_names(
                     file_metadata.version(),
                     &file_metadata.file_schema,
                     &columns.iter().map(|s| s.as_str()).collect::<Vec<&str>>(),
@@ -734,8 +899,6 @@ impl LanceFileReader {
         batch_size: u32,
         batch_readahead: u32,
     ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
-        // read_stream is a synchronous method but it launches tasks and needs to be
-        // run in the context of a tokio runtime
         let inner = self.inner.clone();
         let stream = rt().block_on(None, async move {
             inner
@@ -745,6 +908,7 @@ impl LanceFileReader {
                     batch_readahead,
                     FilterExpression::no_filter(),
                 )
+                .await
                 .infer_error()
         })??;
         Ok(PyArrowType(Box::new(LanceReaderAdapter(stream))))

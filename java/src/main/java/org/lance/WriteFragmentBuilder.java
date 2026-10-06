@@ -13,7 +13,9 @@
  */
 package org.lance;
 
+import org.lance.file.FileWriteOptions;
 import org.lance.namespace.LanceNamespace;
+import org.lance.schema.LanceSchema;
 
 import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.memory.BufferAllocator;
@@ -45,10 +47,12 @@ public class WriteFragmentBuilder {
   private BufferAllocator allocator;
   private VectorSchemaRoot vectorSchemaRoot;
   private ArrowArrayStream arrowArrayStream;
+  private LanceSchema schema;
   private WriteParams writeParams;
   private WriteParams.Builder writeParamsBuilder;
   private LanceNamespace namespaceClient;
   private List<String> tableId;
+  private Session session;
 
   WriteFragmentBuilder() {}
 
@@ -101,6 +105,22 @@ public class WriteFragmentBuilder {
   }
 
   /**
+   * Set the Lance dataset schema to use when writing fragments.
+   *
+   * <p>This is useful for distributed writes where workers create uncommitted fragments and a
+   * coordinator commits them later. When this schema is supplied, lance-core does not need to open
+   * the existing dataset to infer the schema in APPEND mode. The schema should come from the target
+   * dataset so Lance field IDs are preserved.
+   *
+   * @param schema the target Lance dataset schema
+   * @return this builder
+   */
+  public WriteFragmentBuilder schema(LanceSchema schema) {
+    this.schema = schema;
+    return this;
+  }
+
+  /**
    * Set the write parameters.
    *
    * @param params the write parameters
@@ -120,6 +140,22 @@ public class WriteFragmentBuilder {
   public WriteFragmentBuilder storageOptions(Map<String, String> storageOptions) {
     ensureWriteParamsBuilder();
     this.writeParamsBuilder.withStorageOptions(storageOptions);
+    return this;
+  }
+
+  /**
+   * Set runtime-only object store parameters for registered base paths.
+   *
+   * <p>Entries are keyed by the exact {@link BasePath#getPath()} value persisted in the manifest.
+   * Each value is the storage options map used for that base. Bases without an explicit entry use
+   * {@link #storageOptions(Map)} as the fallback.
+   *
+   * @param baseStoreParams object store parameters keyed by base path URI
+   * @return this builder
+   */
+  public WriteFragmentBuilder baseStoreParams(Map<String, Map<String, String>> baseStoreParams) {
+    ensureWriteParamsBuilder();
+    this.writeParamsBuilder.withBaseStoreParams(baseStoreParams);
     return this;
   }
 
@@ -148,6 +184,19 @@ public class WriteFragmentBuilder {
    */
   public WriteFragmentBuilder tableId(List<String> tableId) {
     this.tableId = tableId;
+    return this;
+  }
+
+  /**
+   * Set a session to reuse across operations.
+   *
+   * <p>The session holds shared caches (metadata and index) and the object store registry.
+   *
+   * @param session the session to share
+   * @return this builder
+   */
+  public WriteFragmentBuilder session(Session session) {
+    this.session = session;
     return this;
   }
 
@@ -188,6 +237,18 @@ public class WriteFragmentBuilder {
   }
 
   /**
+   * Set options for configuring the current-format file writer.
+   *
+   * @param fileWriteOptions file writer options
+   * @return this builder
+   */
+  public WriteFragmentBuilder fileWriteOptions(FileWriteOptions fileWriteOptions) {
+    ensureWriteParamsBuilder();
+    this.writeParamsBuilder.withFileWriteOptions(fileWriteOptions);
+    return this;
+  }
+
+  /**
    * Set the write mode.
    *
    * @param mode the write mode
@@ -224,6 +285,30 @@ public class WriteFragmentBuilder {
   }
 
   /**
+   * Register base paths when creating a new dataset from fragments.
+   *
+   * @param bases base paths to register
+   * @return this builder
+   */
+  public WriteFragmentBuilder initialBases(List<BasePath> bases) {
+    ensureWriteParamsBuilder();
+    this.writeParamsBuilder.withInitialBases(bases);
+    return this;
+  }
+
+  /**
+   * Set base names or paths where new fragment files should be written.
+   *
+   * @param targetBases base names or exact paths
+   * @return this builder
+   */
+  public WriteFragmentBuilder targetBases(List<String> targetBases) {
+    ensureWriteParamsBuilder();
+    this.writeParamsBuilder.withTargetBases(targetBases);
+    return this;
+  }
+
+  /**
    * Execute the fragment write operation.
    *
    * @return the list of fragment metadata for the created fragments
@@ -238,10 +323,24 @@ public class WriteFragmentBuilder {
     // storage options provider when these are non-null for credential refresh
     if (vectorSchemaRoot != null) {
       return Fragment.create(
-          datasetUri, allocator, vectorSchemaRoot, finalWriteParams, namespaceClient, tableId);
+          datasetUri,
+          allocator,
+          vectorSchemaRoot,
+          finalWriteParams,
+          namespaceClient,
+          tableId,
+          schema,
+          session);
     } else {
       return Fragment.create(
-          datasetUri, arrowArrayStream, finalWriteParams, namespaceClient, tableId);
+          datasetUri,
+          allocator,
+          arrowArrayStream,
+          finalWriteParams,
+          namespaceClient,
+          tableId,
+          schema,
+          session);
     }
   }
 
@@ -272,6 +371,8 @@ public class WriteFragmentBuilder {
     Preconditions.checkState(
         vectorSchemaRoot == null || allocator != null,
         "allocator is required when using VectorSchemaRoot");
+    Preconditions.checkState(
+        schema == null || allocator != null, "allocator is required with schema");
     Preconditions.checkState(
         writeParams == null || writeParamsBuilder == null,
         "Cannot use both writeParams() and individual parameter methods");

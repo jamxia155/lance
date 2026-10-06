@@ -82,6 +82,60 @@ class TestMultiBase:
             data.sort_values("id").reset_index(drop=True),
         )
 
+    def test_write_target_all_bases(self):
+        """target_all_bases=True rotates across primary and all initial bases."""
+        data = self.create_test_data(300)
+
+        dataset = lance.write_dataset(
+            data,
+            self.primary_uri,
+            mode="create",
+            initial_bases=[
+                DatasetBasePath(self.path1_uri, name="path1"),
+                DatasetBasePath(self.path2_uri, name="path2"),
+            ],
+            target_all_bases=True,
+            max_rows_per_file=100,
+        )
+
+        base_ids = [f.data_files()[0].base_id for f in dataset.get_fragments()]
+        assert base_ids == [None, 1, 2]
+        assert len(dataset.to_table()) == 300
+
+    def test_base_scoped_storage_options(self):
+        """base_<id>.<key> storage options flow through write and read."""
+        data = self.create_test_data(200)
+
+        # Local stores ignore these options; this verifies base-scoped entries
+        # are resolved per base without breaking the write or read path.
+        storage_options = {
+            "shared_option": "shared",
+            "base_1.scoped_option": "base1-value",
+        }
+
+        dataset = lance.write_dataset(
+            data,
+            self.primary_uri,
+            mode="create",
+            initial_bases=[DatasetBasePath(self.path1_uri, name="path1")],
+            target_bases=["path1"],
+            max_rows_per_file=100,
+            storage_options=storage_options,
+        )
+        assert dataset.count_rows() == 200
+
+        # Data files land in the scoped base, not the primary path
+        assert list(Path(self.path1_uri).glob("**/*.lance"))
+        assert not list((Path(self.primary_uri) / "data").glob("*.lance"))
+
+        # Reopen with the same flat options and read through the base store
+        dataset = lance.dataset(self.primary_uri, storage_options=storage_options)
+        result = dataset.to_table().to_pandas()
+        pd.testing.assert_frame_equal(
+            result.sort_values("id").reset_index(drop=True),
+            data.sort_values("id").reset_index(drop=True),
+        )
+
     def test_multi_base_append_mode(self):
         """Test appending data to a multi-base dataset."""
         # Create initial dataset
@@ -160,7 +214,7 @@ class TestMultiBase:
         assert actual_ids == expected_ids
 
         # Verify base_paths are preserved from initial dataset
-        base_paths = updated_dataset._ds.base_paths()
+        base_paths = updated_dataset.base_paths()
         assert len(base_paths) == 2
         assert any(bp.name == "path1" for bp in base_paths.values())
         assert any(bp.name == "path2" for bp in base_paths.values())
@@ -182,16 +236,14 @@ class TestMultiBase:
             max_rows_per_file=50,
         )
 
-        # Overwrite without specifying target - should use primary path
-        # This clears the old base_paths and writes to primary path only
+        # Overwrite without a target writes new files to primary storage while
+        # preserving the registered base paths.
         overwrite_data = self.create_test_data(75, id_offset=200)
 
         updated_dataset = lance.write_dataset(
             overwrite_data,
             self.primary_uri,
             mode="overwrite",
-            # No target_bases specified - data goes to primary path
-            # Old bases (path1, path2) are NOT preserved
             max_rows_per_file=25,
         )
 
@@ -205,7 +257,7 @@ class TestMultiBase:
         assert actual_ids == expected_ids
 
         # Verify base_paths are preserved from previous manifest
-        base_paths = updated_dataset._ds.base_paths()
+        base_paths = updated_dataset.base_paths()
         # Old path1 and path2 ARE preserved in manifest
         assert len(base_paths) == 2
         assert any(bp.name == "path1" for bp in base_paths.values())
@@ -272,7 +324,7 @@ class TestMultiBase:
         assert actual_ids == expected_ids
 
         # Verify base_paths are preserved from previous manifest
-        base_paths = updated_dataset._ds.base_paths()
+        base_paths = updated_dataset.base_paths()
         assert len(base_paths) == 2
         assert any(bp.name == "path1" for bp in base_paths.values())
         assert any(bp.name == "path2" for bp in base_paths.values())
@@ -320,7 +372,7 @@ class TestMultiBase:
         )
 
         # Verify base_paths configuration
-        base_paths = dataset._ds.base_paths()
+        base_paths = dataset.base_paths()
         assert len(base_paths) == 2
 
         # Find path1 and path2 in base_paths
@@ -365,7 +417,7 @@ class TestMultiBase:
         )
 
         # Get the base_paths to find the actual path URI for path2
-        base_paths = dataset._ds.base_paths()
+        base_paths = dataset.base_paths()
         path2_base = None
         for base_path in base_paths.values():
             if base_path.name == "path2":
@@ -396,7 +448,7 @@ class TestMultiBase:
 
         # Verify that new fragments are in path2 (not primary or path1)
         fragments = list(updated_dataset.get_fragments())
-        base_paths_updated = updated_dataset._ds.base_paths()
+        base_paths_updated = updated_dataset.base_paths()
 
         path1_fragments = 0
         path2_fragments = 0
@@ -788,37 +840,104 @@ class TestAddBases:
         assert len(result) == 10
 
     def test_add_bases_verify_base_paths(self):
-        """Test that get_base_paths returns added bases."""
-        # Create dataset
+        """Test that base_paths exposes every registered base by ID."""
         data = pd.DataFrame({"id": range(10), "value": range(10)})
+        dataset = lance.write_dataset(data, self.primary_uri, mode="create")
+        assert dataset.base_paths() == {}
+
+        dataset.add_bases(
+            [
+                DatasetBasePath(self.new_base1, name="new_base1", is_dataset_root=True),
+                DatasetBasePath(self.new_base2),
+            ]
+        )
+
+        base_paths = dataset.base_paths()
+        assert len(base_paths) == 2
+        assert all(base_id == base.id for base_id, base in base_paths.items())
+
+        bases_by_path = {base.path: base for base in base_paths.values()}
+        assert set(bases_by_path) == {self.new_base1, self.new_base2}
+
+        named_base = bases_by_path[self.new_base1]
+        assert named_base.name == "new_base1"
+        assert named_base.is_dataset_root is True
+
+        unnamed_base = bases_by_path[self.new_base2]
+        assert unnamed_base.name is None
+        assert unnamed_base.is_dataset_root is False
+        assert all(base.path != self.primary_uri for base in base_paths.values())
+        assert all(not hasattr(base, "storage_options") for base in base_paths.values())
+
+    @pytest.mark.parametrize(
+        ("attribute", "value"),
+        [
+            pytest.param("id", 99, id="id"),
+            pytest.param("name", "changed", id="name"),
+            pytest.param("path", "changed", id="path"),
+            pytest.param("is_dataset_root", False, id="is_dataset_root"),
+        ],
+    )
+    def test_base_paths_results_are_isolated(self, attribute, value):
+        """Returned mappings are detached and base attributes are read-only."""
         dataset = lance.write_dataset(
+            pd.DataFrame({"id": range(10)}),
+            self.primary_uri,
+            mode="create",
+            initial_bases=[
+                DatasetBasePath(
+                    self.initial_base,
+                    name="initial_base",
+                    is_dataset_root=True,
+                )
+            ],
+        )
+
+        base_paths = dataset.base_paths()
+        assert len(base_paths) == 1
+        base = next(iter(base_paths.values()))
+        assert base_paths[base.id] is base
+        base_paths.clear()
+
+        assert len(dataset.base_paths()) == 1
+        with pytest.raises(AttributeError):
+            setattr(base, attribute, value)
+
+        del dataset
+        assert base.id == 1
+        assert base.name == "initial_base"
+        assert base.path == self.initial_base
+        assert base.is_dataset_root is True
+
+    def test_base_paths_uses_current_snapshot(self):
+        """Base enumeration does not implicitly refresh an open dataset."""
+        data = pd.DataFrame({"id": range(10)})
+        stale_dataset = lance.write_dataset(
             data,
             self.primary_uri,
             mode="create",
             initial_bases=[DatasetBasePath(self.initial_base, name="initial_base")],
-            target_bases=["initial_base"],
         )
+        old_base_paths = stale_dataset.base_paths()
 
-        # Add new bases
-        dataset = lance.dataset(self.primary_uri)
-        dataset.add_bases(
-            [
-                DatasetBasePath(self.new_base1, name="new_base1"),
-                DatasetBasePath(self.new_base2, name="new_base2"),
-            ]
-        )
+        latest_dataset = lance.dataset(self.primary_uri)
+        latest_dataset.add_bases([DatasetBasePath(self.new_base1, name="new_base1")])
 
-        # Get base paths
-        base_paths = dataset._ds.base_paths()
+        assert {base.name for base in old_base_paths.values()} == {"initial_base"}
+        assert {base.name for base in stale_dataset.base_paths().values()} == {
+            "initial_base"
+        }
+        assert {base.name for base in latest_dataset.base_paths().values()} == {
+            "initial_base",
+            "new_base1",
+        }
 
-        # Should have 3 bases now (initial + 2 new)
-        assert len(base_paths) == 3
-
-        # Check that all bases are present
-        names = [bp.name for bp in base_paths.values()]
-        assert "initial_base" in names
-        assert "new_base1" in names
-        assert "new_base2" in names
+        stale_dataset.checkout_latest()
+        assert {base.name for base in stale_dataset.base_paths().values()} == {
+            "initial_base",
+            "new_base1",
+        }
+        assert {base.name for base in old_base_paths.values()} == {"initial_base"}
 
     def test_add_bases_large_data_distribution(self):
         """Test adding bases and distributing large amounts of data."""
@@ -939,7 +1058,7 @@ class TestAddBases:
         )
 
         # Verify the base was added
-        base_paths = dataset._ds.base_paths()
+        base_paths = dataset.base_paths()
         names = [bp.name for bp in base_paths.values()]
         assert "new_base1" in names
 
@@ -1031,6 +1150,7 @@ class TestWriteFragmentsWithTargetBases:
             dataset,
             mode="append",
             target_bases=["base2"],
+            base_store_params={self.base2_uri: {}},
             max_rows_per_file=25,
         )
 
@@ -1053,6 +1173,42 @@ class TestWriteFragmentsWithTargetBases:
         base2_path = Path(self.base2_uri)
         data_files = list(base2_path.glob("**/*.lance"))
         assert len(data_files) > 0, "Expected data files in base2"
+
+    def test_write_fragments_with_base_store_params(self):
+        """Test write_fragments inherits base_store_params from LanceDataset."""
+        initial_data = pd.DataFrame({"id": range(10), "value": range(10)})
+
+        dataset = lance.write_dataset(
+            initial_data,
+            self.primary_uri,
+            mode="create",
+            initial_bases=[
+                DatasetBasePath(self.base1_uri, name="base1"),
+                DatasetBasePath(self.base2_uri, name="base2"),
+            ],
+            target_bases=["base1"],
+            base_store_params={self.base2_uri: {}},
+            max_rows_per_file=10,
+        )
+
+        fragment_data = pd.DataFrame({"id": range(10, 20), "value": range(10, 20)})
+        fragments = write_fragments(
+            pa.Table.from_pandas(fragment_data),
+            dataset,
+            mode="append",
+            target_bases=["base2"],
+            max_rows_per_file=10,
+        )
+
+        operation = lance.LanceOperation.Append(fragments)
+        dataset = lance.LanceDataset.commit(
+            dataset, operation, read_version=dataset.version
+        )
+
+        result = dataset.to_table().to_pandas()
+        assert len(result) == 20
+        assert set(result["id"]) == set(range(20))
+        assert list(Path(self.base2_uri).glob("**/*.lance"))
 
     def test_write_fragments_transaction_with_target_bases(self):
         """Test write_fragments with return_transaction and target_bases."""
@@ -1196,7 +1352,7 @@ class TestWriteFragmentsWithTargetBases:
         assert set(result["id"]) == set(range(20))
 
         # Verify base paths are registered
-        base_paths = dataset._ds.base_paths()
+        base_paths = dataset.base_paths()
         assert len(base_paths) == 2  # 2 bases (base1, base2)
         # Check that our named bases are registered
         base_names = [bp.name for bp in base_paths.values() if bp.name is not None]
@@ -1211,3 +1367,307 @@ class TestWriteFragmentsWithTargetBases:
         dataset_root = Path(dataset_uri)
         data_files_root = list(dataset_root.glob("*.lance"))
         assert len(data_files_root) == 0, "Should not have data files in root"
+
+
+class TestDataReplacementWithBases:
+    """DataReplacement must preserve DataFile.base_id so replacement files can
+    live in (and resolve against) a storage base other than the dataset root."""
+
+    def setup_method(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.primary_uri = str(Path(self.test_dir) / "primary")
+        self.base1_uri = str(Path(self.test_dir) / "base1")
+        Path(self.base1_uri).mkdir(parents=True, exist_ok=True)
+
+    def teardown_method(self):
+        if hasattr(self, "test_dir"):
+            shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def _make_two_base_dataset(self) -> "lance.LanceDataset":
+        """Fragment 0 at the dataset root, fragment 1 in base1; column a."""
+        ds = lance.write_dataset(
+            pa.table({"a": list(range(8))}),
+            self.primary_uri,
+            max_rows_per_file=8,
+        )
+        ds.add_bases([DatasetBasePath(self.base1_uri, name="b1", is_dataset_root=True)])
+        return lance.write_dataset(
+            pa.table({"a": list(range(8, 16))}),
+            self.primary_uri,
+            mode="append",
+            max_rows_per_file=8,
+            target_bases=["b1"],
+        )
+
+    def _write_bare_file(self, data_dir: str, data: pa.Table) -> str:
+        from lance.file import LanceFileWriter
+
+        name = f"{uuid.uuid4()}.lance"
+        Path(data_dir).mkdir(parents=True, exist_ok=True)
+        with LanceFileWriter(f"{data_dir}/{name}") as writer:
+            writer.write_batch(data)
+        return name
+
+    def _b_data_file(self, name: str, base_id=None) -> "lance.fragment.DataFile":
+        from lance.file import stable_version
+        from lance.fragment import DataFile
+
+        return DataFile(
+            path=name,
+            fields=[1],  # field id of column "b" (a=0, b=1)
+            column_indices=[0],
+            file_major_version=int(stable_version().split(".")[0]),
+            file_minor_version=int(stable_version().split(".")[1]),
+            base_id=base_id,
+        )
+
+    def test_data_replacement_new_column_into_base(self):
+        """The all-NULL-column special case: the new column's data file for a
+        base fragment is written into that base and must keep its base_id."""
+        ds = self._make_two_base_dataset()
+        ds.add_columns(pa.field("b", pa.int32()))
+        ds = lance.dataset(self.primary_uri)
+
+        root_name = self._write_bare_file(
+            f"{self.primary_uri}/data",
+            pa.table({"b": pa.array([x * 10 for x in range(8)], pa.int32())}),
+        )
+        base_name = self._write_bare_file(
+            f"{self.base1_uri}/data",
+            pa.table({"b": pa.array([x * 10 for x in range(8, 16)], pa.int32())}),
+        )
+
+        op = lance.LanceOperation.DataReplacement(
+            [
+                lance.LanceOperation.DataReplacementGroup(
+                    0, self._b_data_file(root_name)
+                ),
+                lance.LanceOperation.DataReplacementGroup(
+                    1, self._b_data_file(base_name, base_id=1)
+                ),
+            ]
+        )
+        ds = lance.LanceDataset.commit(self.primary_uri, op, read_version=ds.version)
+
+        frags = ds.get_fragments()
+        root_files = {f.path: f.base_id for f in frags[0].data_files()}
+        base_files = {f.path: f.base_id for f in frags[1].data_files()}
+        assert root_files[root_name] is None
+        assert base_files[base_name] == 1
+
+        table = ds.to_table()
+        assert table.column("b").to_pylist() == [x * 10 for x in range(16)]
+
+    def test_data_replacement_replace_existing_file_in_base(self):
+        """The replace-existing-file branch must take the new file's base_id."""
+        ds = self._make_two_base_dataset()
+        ds.add_columns(pa.field("b", pa.int32()))
+        ds = lance.dataset(self.primary_uri)
+
+        first = self._write_bare_file(
+            f"{self.base1_uri}/data",
+            pa.table({"b": pa.array([0] * 8, pa.int32())}),
+        )
+        op = lance.LanceOperation.DataReplacement(
+            [lance.LanceOperation.DataReplacementGroup(1, self._b_data_file(first, 1))]
+        )
+        ds = lance.LanceDataset.commit(self.primary_uri, op, read_version=ds.version)
+
+        # Replace the same column file again, still in base1.
+        second = self._write_bare_file(
+            f"{self.base1_uri}/data",
+            pa.table({"b": pa.array([x * 10 for x in range(8, 16)], pa.int32())}),
+        )
+        op = lance.LanceOperation.DataReplacement(
+            [lance.LanceOperation.DataReplacementGroup(1, self._b_data_file(second, 1))]
+        )
+        ds = lance.LanceDataset.commit(self.primary_uri, op, read_version=ds.version)
+
+        base_files = {f.path: f.base_id for f in ds.get_fragments()[1].data_files()}
+        assert base_files[second] == 1
+        assert first not in base_files
+        assert ds.to_table().column("b").to_pylist()[8:] == [
+            x * 10 for x in range(8, 16)
+        ]
+
+
+class TestMergeInsertMultiBase:
+    """Test merge insert on multi-base datasets."""
+
+    def setup_method(self):
+        """Set up test directories for each test."""
+        self.test_dir = tempfile.mkdtemp()
+        self.primary_uri = str(Path(self.test_dir) / "primary")
+        self.base1_uri = str(Path(self.test_dir) / "base1")
+        self.base2_uri = str(Path(self.test_dir) / "base2")
+        for uri in [self.primary_uri, self.base1_uri, self.base2_uri]:
+            Path(uri).mkdir(parents=True, exist_ok=True)
+
+    def teardown_method(self):
+        """Clean up test directories after each test."""
+        if hasattr(self, "test_dir"):
+            shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def create_dataset(self):
+        """Dataset with two registered bases and initial data in base1."""
+        initial_data = pd.DataFrame(
+            {
+                "id": range(100),
+                "value": [f"initial_{i}" for i in range(100)],
+            }
+        )
+        return lance.write_dataset(
+            initial_data,
+            self.primary_uri,
+            mode="create",
+            initial_bases=[
+                DatasetBasePath(self.base1_uri, name="base1"),
+                DatasetBasePath(self.base2_uri, name="base2"),
+            ],
+            target_bases=["base1"],
+            max_rows_per_file=50,
+        )
+
+    def base_name_of(self, dataset, data_file):
+        base_paths = dataset.base_paths()
+        if data_file.base_id is None:
+            return None
+        return base_paths[data_file.base_id].name
+
+    def test_merge_insert_without_target_bases(self):
+        """Merge insert on a multi-base dataset writes to primary by default."""
+        dataset = self.create_dataset()
+
+        new_data = pd.DataFrame(
+            {
+                "id": range(50, 150),
+                "value": [f"updated_{i}" for i in range(50, 150)],
+            }
+        )
+        stats = (
+            dataset.merge_insert("id")
+            .when_matched_update_all()
+            .when_not_matched_insert_all()
+            .execute(new_data)
+        )
+        assert stats["num_updated_rows"] == 50
+        assert stats["num_inserted_rows"] == 50
+
+        result = dataset.to_table().to_pandas().sort_values("id")
+        assert len(result) == 150
+        assert list(result[result["id"] >= 50]["value"]) == [
+            f"updated_{i}" for i in range(50, 150)
+        ]
+
+        # New fragments (merge output) are in primary storage.
+        max_initial_fragment_id = 1  # 100 rows / 50 per file -> fragments 0, 1
+        for fragment in dataset.get_fragments():
+            is_initial = fragment.fragment_id <= max_initial_fragment_id
+            for data_file in fragment.data_files():
+                expected = "base1" if is_initial else None
+                assert self.base_name_of(dataset, data_file) == expected
+
+    def test_merge_insert_with_target_bases(self):
+        """Merge insert routes new fragments to the requested base."""
+        dataset = self.create_dataset()
+
+        new_data = pd.DataFrame(
+            {
+                "id": range(50, 150),
+                "value": [f"updated_{i}" for i in range(50, 150)],
+            }
+        )
+        stats = (
+            dataset.merge_insert("id")
+            .when_matched_update_all()
+            .when_not_matched_insert_all()
+            .target_bases(["base2"])
+            .execute(new_data)
+        )
+        assert stats["num_updated_rows"] == 50
+        assert stats["num_inserted_rows"] == 50
+
+        result = dataset.to_table().to_pandas().sort_values("id")
+        assert len(result) == 150
+        assert list(result[result["id"] >= 50]["value"]) == [
+            f"updated_{i}" for i in range(50, 150)
+        ]
+
+        merge_files = 0
+        for fragment in dataset.get_fragments():
+            if fragment.fragment_id > 1:
+                for data_file in fragment.data_files():
+                    assert self.base_name_of(dataset, data_file) == "base2"
+                    merge_files += 1
+        assert merge_files > 0
+        assert list(Path(self.base2_uri).glob("**/*.lance"))
+
+        # The routed dataset stays readable from a fresh instance.
+        reloaded = lance.dataset(self.primary_uri)
+        assert reloaded.count_rows() == 150
+
+    def test_merge_insert_with_unknown_target_base(self):
+        """Merge insert referencing an unregistered base fails."""
+        dataset = self.create_dataset()
+
+        new_data = pd.DataFrame({"id": [1], "value": ["updated_1"]})
+        with pytest.raises(Exception, match="not found in available bases"):
+            (
+                dataset.merge_insert("id")
+                .when_matched_update_all()
+                .when_not_matched_insert_all()
+                .target_bases(["nonexistent"])
+                .execute(new_data)
+            )
+
+    def test_merge_insert_target_primary_via_uri(self):
+        """The dataset URI in target_bases selects primary storage."""
+        dataset = self.create_dataset()
+
+        new_data = pd.DataFrame({"id": [200], "value": ["inserted_200"]})
+        (
+            dataset.merge_insert("id")
+            .when_not_matched_insert_all()
+            .target_bases([dataset.uri, "base2"])
+            .execute(new_data)
+        )
+        assert dataset.count_rows() == 101
+
+        # The single new file lands in the first slot: primary storage.
+        for fragment in dataset.get_fragments():
+            if fragment.fragment_id > 1:
+                for data_file in fragment.data_files():
+                    assert self.base_name_of(dataset, data_file) is None
+
+    def test_merge_insert_target_all_bases(self):
+        """target_all_bases spreads new files across all bases, primary first."""
+        dataset = self.create_dataset()
+
+        new_data = pd.DataFrame({"id": [300], "value": ["inserted_300"]})
+        (
+            dataset.merge_insert("id")
+            .when_not_matched_insert_all()
+            .target_all_bases()
+            .execute(new_data)
+        )
+        assert dataset.count_rows() == 101
+        # A single new file lands in the first slot: primary storage.
+        newest = max(f.fragment_id for f in dataset.get_fragments())
+        for fragment in dataset.get_fragments():
+            if fragment.fragment_id == newest:
+                for data_file in fragment.data_files():
+                    assert self.base_name_of(dataset, data_file) is None
+
+        new_data = pd.DataFrame({"id": [301], "value": ["inserted_301"]})
+        (
+            dataset.merge_insert("id")
+            .when_not_matched_insert_all()
+            .target_all_bases(include_primary=False)
+            .execute(new_data)
+        )
+        assert dataset.count_rows() == 102
+        newest = max(f.fragment_id for f in dataset.get_fragments())
+        for fragment in dataset.get_fragments():
+            if fragment.fragment_id == newest:
+                for data_file in fragment.data_files():
+                    assert self.base_name_of(dataset, data_file) == "base1"

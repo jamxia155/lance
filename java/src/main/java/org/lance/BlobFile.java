@@ -41,6 +41,9 @@ public final class BlobFile implements Closeable {
     JniLoader.ensureLoaded();
   }
 
+  /** Default sequential read-ahead size in bytes. */
+  public static final int DEFAULT_READ_BUFFER_SIZE = 512 * 1024;
+
   /** Opaque native handle managed by lance-jni. */
   @SuppressWarnings("FieldCanBeLocal")
   private long nativeBlobHandle;
@@ -59,10 +62,28 @@ public final class BlobFile implements Closeable {
     return nativeReadUpTo(len);
   }
 
+  /** Read a blob-local range without changing the current cursor. */
+  public byte[] readRange(long offset, int len) throws IOException {
+    if (offset < 0) throw new IllegalArgumentException("offset must be non-negative");
+    if (len < 0) throw new IllegalArgumentException("len must be non-negative");
+    return nativeReadRange(offset, len);
+  }
+
   /** Seek to a new cursor position. */
   public void seek(long newCursor) throws IOException {
     if (newCursor < 0) throw new IllegalArgumentException("newCursor must be non-negative");
     nativeSeek(newCursor);
+  }
+
+  /**
+   * Sequential read-ahead size in bytes. {@code 0} disables read-ahead. Range reads do not use this
+   * buffer.
+   */
+  public void setReadBufferSize(long bufferSize) throws IOException {
+    if (bufferSize < 0) {
+      throw new IllegalArgumentException("bufferSize must be non-negative");
+    }
+    nativeSetReadBufferSize(bufferSize);
   }
 
   /** Return current cursor position. */
@@ -89,6 +110,8 @@ public final class BlobFile implements Closeable {
   private native byte[] nativeReadRange(long offset, int len) throws IOException;
 
   private native void nativeSeek(long newCursor) throws IOException;
+
+  private native void nativeSetReadBufferSize(long bufferSize) throws IOException;
 
   private native long nativeTell() throws IOException;
 

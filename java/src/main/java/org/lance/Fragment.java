@@ -13,11 +13,13 @@
  */
 package org.lance;
 
+import org.lance.file.FileWriteOptions;
 import org.lance.fragment.FragmentMergeResult;
 import org.lance.fragment.FragmentUpdateResult;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
 import org.lance.namespace.LanceNamespace;
+import org.lance.schema.LanceSchema;
 
 import org.apache.arrow.c.ArrowArray;
 import org.apache.arrow.c.ArrowArrayStream;
@@ -112,7 +114,9 @@ public class Fragment {
    *     returns a new fragment with the updated deletion vector.
    */
   public FragmentMetadata deleteRows(List<Integer> rowIndexes) {
-    return nativeDeleteRows(dataset, fragmentMetadata.getId(), rowIndexes);
+    try (LockManager.ReadLock readLock = dataset.acquireReadLock()) {
+      return nativeDeleteRows(dataset, fragmentMetadata.getId(), rowIndexes);
+    }
   }
 
   private static native FragmentMetadata nativeDeleteRows(
@@ -128,7 +132,9 @@ public class Fragment {
    * @return row counts in this Fragment
    */
   public int countRows() {
-    return countRowsNative(dataset, fragmentMetadata.getId());
+    try (LockManager.ReadLock readLock = dataset.acquireReadLock()) {
+      return countRowsNative(dataset, fragmentMetadata.getId());
+    }
   }
 
   /**
@@ -152,8 +158,10 @@ public class Fragment {
    * @return the fragment metadata and new schema.
    */
   public FragmentMergeResult mergeColumns(ArrowArrayStream stream, String leftOn, String rightOn) {
-    return nativeMergeColumns(
-        dataset, fragmentMetadata.getId(), stream.memoryAddress(), leftOn, rightOn);
+    try (LockManager.ReadLock readLock = dataset.acquireReadLock()) {
+      return nativeMergeColumns(
+          dataset, fragmentMetadata.getId(), stream.memoryAddress(), leftOn, rightOn);
+    }
   }
 
   private native FragmentMergeResult nativeMergeColumns(
@@ -185,8 +193,10 @@ public class Fragment {
    */
   public FragmentUpdateResult updateColumns(
       ArrowArrayStream stream, String leftOn, String rightOn) {
-    return nativeUpdateColumns(
-        dataset, fragmentMetadata.getId(), stream.memoryAddress(), leftOn, rightOn);
+    try (LockManager.ReadLock readLock = dataset.acquireReadLock()) {
+      return nativeUpdateColumns(
+          dataset, fragmentMetadata.getId(), stream.memoryAddress(), leftOn, rightOn);
+    }
   }
 
   public FragmentUpdateResult updateColumns(ArrowArrayStream stream) {
@@ -199,6 +209,33 @@ public class Fragment {
       long arrowStreamMemoryAddress,
       String leftOn,
       String rightOn);
+
+  /**
+   * Append new columns to this Fragment from a stream of new-column values. This is the
+   * fragment-level equivalent of {@link Dataset#addColumns(ArrowArrayStream, Optional)}: the stream
+   * is zipped positionally against the fragment, so it must contain exactly one row for every live
+   * (non-deleted) row of this fragment, in row address order, and only the new columns. A stream
+   * with too few or too many rows fails; use {@link #mergeColumns} for inputs that cover a subset
+   * of the rows.
+   *
+   * <p>Unlike {@link #mergeColumns}, the stream is never buffered in full, so it can backfill
+   * columns far larger than memory.
+   *
+   * <p>The returned Result will be further committed.
+   *
+   * @param stream the new column values, one row per live row in row address order
+   * @param batchSize read batch size for zipping, or empty for the default
+   * @return the fragment metadata and new schema
+   */
+  public FragmentMergeResult addColumns(ArrowArrayStream stream, Optional<Long> batchSize) {
+    try (LockManager.ReadLock readLock = dataset.acquireReadLock()) {
+      return nativeAddColumnsByReader(
+          dataset, fragmentMetadata.getId(), stream.memoryAddress(), batchSize);
+    }
+  }
+
+  private native FragmentMergeResult nativeAddColumnsByReader(
+      Dataset dataset, long fragmentId, long arrowStreamMemoryAddress, Optional<Long> batchSize);
 
   /**
    * Create a new fragment writer builder.
@@ -260,13 +297,53 @@ public class Fragment {
       WriteParams params,
       LanceNamespace namespaceClient,
       List<String> tableId) {
+    return create(datasetUri, allocator, root, params, namespaceClient, tableId, null, null);
+  }
+
+  /** Create a fragment from the given arrow array and schema. */
+  static List<FragmentMetadata> create(
+      String datasetUri,
+      BufferAllocator allocator,
+      VectorSchemaRoot root,
+      WriteParams params,
+      LanceNamespace namespaceClient,
+      List<String> tableId,
+      LanceSchema schema,
+      Session session) {
     Preconditions.checkNotNull(datasetUri);
     Preconditions.checkNotNull(allocator);
     Preconditions.checkNotNull(root);
     Preconditions.checkNotNull(params);
+    long sessionHandle = getSessionHandle(session);
     try (ArrowSchema arrowSchema = ArrowSchema.allocateNew(allocator);
         ArrowArray arrowArray = ArrowArray.allocateNew(allocator)) {
       Data.exportVectorSchemaRoot(allocator, root, null, arrowArray, arrowSchema);
+      if (schema != null) {
+        try (ArrowSchema lanceSchema = ArrowSchema.allocateNew(allocator)) {
+          Data.exportSchema(allocator, schema.asArrowSchemaWithFieldIds(), null, lanceSchema);
+          return createWithFfiArray(
+              datasetUri,
+              arrowArray.memoryAddress(),
+              arrowSchema.memoryAddress(),
+              params.getMaxRowsPerFile(),
+              params.getMaxRowsPerGroup(),
+              params.getMaxBytesPerFile(),
+              params.getMode(),
+              params.getEnableStableRowIds(),
+              params.getDataStorageVersion(),
+              params.getStorageOptions(),
+              params.getBaseStoreParams(),
+              params.getInitialBases(),
+              params.getTargetBases(),
+              namespaceClient,
+              tableId,
+              params.getAllowExternalBlobOutsideBases(),
+              params.getBlobPackFileSizeThreshold(),
+              params.getFileWriteOptions(),
+              lanceSchema.memoryAddress(),
+              sessionHandle);
+        }
+      }
       return createWithFfiArray(
           datasetUri,
           arrowArray.memoryAddress(),
@@ -278,10 +355,16 @@ public class Fragment {
           params.getEnableStableRowIds(),
           params.getDataStorageVersion(),
           params.getStorageOptions(),
+          params.getBaseStoreParams(),
+          params.getInitialBases(),
+          params.getTargetBases(),
           namespaceClient,
           tableId,
           params.getAllowExternalBlobOutsideBases(),
-          params.getBlobPackFileSizeThreshold());
+          params.getBlobPackFileSizeThreshold(),
+          params.getFileWriteOptions(),
+          0L,
+          sessionHandle);
     }
   }
 
@@ -292,9 +375,49 @@ public class Fragment {
       WriteParams params,
       LanceNamespace namespaceClient,
       List<String> tableId) {
+    return create(datasetUri, null, stream, params, namespaceClient, tableId, null, null);
+  }
+
+  /** Create a fragment from the given arrow stream. */
+  static List<FragmentMetadata> create(
+      String datasetUri,
+      BufferAllocator allocator,
+      ArrowArrayStream stream,
+      WriteParams params,
+      LanceNamespace namespaceClient,
+      List<String> tableId,
+      LanceSchema schema,
+      Session session) {
     Preconditions.checkNotNull(datasetUri);
     Preconditions.checkNotNull(stream);
     Preconditions.checkNotNull(params);
+    long sessionHandle = getSessionHandle(session);
+    if (schema != null) {
+      Preconditions.checkNotNull(allocator, "allocator is required with schema");
+      try (ArrowSchema lanceSchema = ArrowSchema.allocateNew(allocator)) {
+        Data.exportSchema(allocator, schema.asArrowSchemaWithFieldIds(), null, lanceSchema);
+        return createWithFfiStream(
+            datasetUri,
+            stream.memoryAddress(),
+            params.getMaxRowsPerFile(),
+            params.getMaxRowsPerGroup(),
+            params.getMaxBytesPerFile(),
+            params.getMode(),
+            params.getEnableStableRowIds(),
+            params.getDataStorageVersion(),
+            params.getStorageOptions(),
+            params.getBaseStoreParams(),
+            params.getInitialBases(),
+            params.getTargetBases(),
+            namespaceClient,
+            tableId,
+            params.getAllowExternalBlobOutsideBases(),
+            params.getBlobPackFileSizeThreshold(),
+            params.getFileWriteOptions(),
+            lanceSchema.memoryAddress(),
+            sessionHandle);
+      }
+    }
     return createWithFfiStream(
         datasetUri,
         stream.memoryAddress(),
@@ -305,10 +428,24 @@ public class Fragment {
         params.getEnableStableRowIds(),
         params.getDataStorageVersion(),
         params.getStorageOptions(),
+        params.getBaseStoreParams(),
+        params.getInitialBases(),
+        params.getTargetBases(),
         namespaceClient,
         tableId,
         params.getAllowExternalBlobOutsideBases(),
-        params.getBlobPackFileSizeThreshold());
+        params.getBlobPackFileSizeThreshold(),
+        params.getFileWriteOptions(),
+        0L,
+        sessionHandle);
+  }
+
+  /**
+   * Resolves the native handle of an optional session. A closed session has a zero handle and is
+   * treated as absent, matching how Dataset handles closed sessions.
+   */
+  private static long getSessionHandle(Session session) {
+    return session == null ? 0L : session.getNativeHandle();
   }
 
   /** Create a fragment from the given arrow array and schema. */
@@ -323,10 +460,16 @@ public class Fragment {
       Optional<Boolean> enableStableRowIds,
       Optional<String> dataStorageVersion,
       Map<String, String> storageOptions,
+      Map<String, Map<String, String>> baseStoreParams,
+      Optional<List<BasePath>> initialBases,
+      Optional<List<String>> targetBases,
       LanceNamespace namespaceClient,
       List<String> tableId,
       Optional<Boolean> allowExternalBlobOutsideBases,
-      Optional<Long> blobPackFileSizeThreshold);
+      Optional<Long> blobPackFileSizeThreshold,
+      FileWriteOptions fileWriteOptions,
+      long schemaMemoryAddress,
+      long sessionHandle);
 
   /** Create a fragment from the given arrow stream. */
   private static native List<FragmentMetadata> createWithFfiStream(
@@ -339,8 +482,14 @@ public class Fragment {
       Optional<Boolean> enableStableRowIds,
       Optional<String> dataStorageVersion,
       Map<String, String> storageOptions,
+      Map<String, Map<String, String>> baseStoreParams,
+      Optional<List<BasePath>> initialBases,
+      Optional<List<String>> targetBases,
       LanceNamespace namespaceClient,
       List<String> tableId,
       Optional<Boolean> allowExternalBlobOutsideBases,
-      Optional<Long> blobPackFileSizeThreshold);
+      Optional<Long> blobPackFileSizeThreshold,
+      FileWriteOptions fileWriteOptions,
+      long schemaMemoryAddress,
+      long sessionHandle);
 }

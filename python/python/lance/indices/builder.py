@@ -57,7 +57,9 @@ class IndicesBuilder:
         """
         self.dataset = dataset
         self.column = self._normalize_column(column)
-        self.dimension = self.dataset.schema.field(self.column[0]).type.list_size
+        self.dimension = self._vector_dimension(
+            self.dataset.schema.field(self.column[0]).type
+        )
 
     def train_ivf(
         self,
@@ -154,7 +156,7 @@ class IndicesBuilder:
                 max_iters=max_iters,
             )
             num_dims = ivf_centroids.shape[1]
-            ivf_centroids.shape = -1
+            ivf_centroids = ivf_centroids.reshape(-1)
             flat_centroids_array = pa.array(ivf_centroids)
             centroids_array = pa.FixedSizeListArray.from_arrays(
                 flat_centroids_array, num_dims
@@ -168,6 +170,7 @@ class IndicesBuilder:
         *,
         sample_rate: int = 256,
         max_iters: int = 50,
+        num_bits: int = 8,
         fragment_ids: Optional[list[int]] = None,
     ) -> PqModel:
         """
@@ -199,15 +202,16 @@ class IndicesBuilder:
             This parameter is used in the same way as in the IVF model.
         max_iters: int
             This parameter is used in the same way as in the IVF model.
+        num_bits: int
+            The number of bits used to encode each PQ centroid.
         fragment_ids: list[int], optional
             If provided, train using only the specified fragments from the dataset.
         """
         from lance.lance import indices
 
         num_rows = self._count_rows(fragment_ids)
-        self.dataset.schema.field(self.column[0]).type.list_size
         num_subvectors = self._normalize_pq_params(num_subvectors, self.dimension)
-        self._verify_pq_sample_rate(num_rows, sample_rate)
+        self._verify_pq_sample_rate(num_rows, sample_rate, num_bits)
         distance_type = ivf_model.distance_type
         pq_codebook = indices.train_pq_model(
             self.dataset._ds,
@@ -219,8 +223,9 @@ class IndicesBuilder:
             max_iters,
             ivf_model.centroids,
             fragment_ids,
+            num_bits,
         )
-        return PqModel(num_subvectors, pq_codebook)
+        return PqModel(num_subvectors, pq_codebook, num_bits=num_bits)
 
     def prepare_global_ivf_pq(
         self,
@@ -231,6 +236,7 @@ class IndicesBuilder:
         accelerator: Optional[Union[str, "torch.Device"]] = None,
         sample_rate: int = 256,
         max_iters: int = 50,
+        num_bits: int = 8,
         fragment_ids: Optional[list[int]] = None,
     ) -> dict:
         """
@@ -292,6 +298,7 @@ class IndicesBuilder:
             num_subvectors,
             sample_rate=sample_rate,
             max_iters=max_iters,
+            num_bits=num_bits,
             fragment_ids=fragment_ids,
         )
 
@@ -385,7 +392,7 @@ class IndicesBuilder:
         """
         from lance.lance import indices
 
-        dimension = self.dataset.schema.field(self.column[0]).type.list_size
+        dimension = self.dimension
         num_subvectors = pq.num_subvectors
         distance_type = ivf.distance_type
         if fragments is None:
@@ -406,6 +413,7 @@ class IndicesBuilder:
             dest_uri,
             fragments,
             partition_ds_uri,
+            pq.num_bits,
         )
 
     def shuffle_transformed_vectors(
@@ -478,7 +486,7 @@ class IndicesBuilder:
             The PQ model used to create the inputs.
         """
 
-        pq_dimension = self.dataset.schema.field(self.column[0]).type.list_size
+        pq_dimension = self.dimension
         num_subvectors = pq.num_subvectors
         distance_type = ivf.distance_type
 
@@ -496,6 +504,7 @@ class IndicesBuilder:
                 num_subvectors,
                 distance_type,
                 index_name,
+                pq.num_bits,
             )
         else:
             raise ValueError("filenames must be a list of strings")
@@ -551,13 +560,17 @@ class IndicesBuilder:
                 f"The sample_rate must be an int greater than 1, got {sample_rate}"
             )
 
-    def _verify_pq_sample_rate(self, num_rows: int, sample_rate: int):
+    def _verify_pq_sample_rate(
+        self, num_rows: int, sample_rate: int, num_bits: int = 8
+    ):
         self._verify_base_sample_rate(sample_rate)
-        if 256 * sample_rate > num_rows:
+        required_rows = (2**num_bits) * sample_rate
+        if required_rows > num_rows:
             raise ValueError(
                 "There are not enough rows in the dataset to create PQ"
-                f" codebook with a sample rate of {sample_rate}.  {sample_rate * 256}"
-                f" rows needed and there are {num_rows}"
+                f" codebook with a sample rate of {sample_rate} and num_bits"
+                f" of {num_bits}.  {required_rows} rows needed and there are"
+                f" {num_rows}"
             )
 
     def _verify_ivf_sample_rate(
@@ -604,27 +617,45 @@ class IndicesBuilder:
             if c not in self.dataset.schema.names:
                 raise KeyError(f"{c} not found in schema")
             field = self.dataset.schema.field(c)
-            if not (
-                pa.types.is_fixed_size_list(field.type)
-                or (
-                    isinstance(field.type, pa.FixedShapeTensorType)
-                    and len(field.type.shape) == 1
-                )
-            ):
+            vector_type = self._describe_vector_type(field.type)
+            if vector_type is None:
                 raise TypeError(
-                    f"Vector column {c} must be FixedSizeListArray "
+                    f"Vector column {c} must be FixedSizeListArray, "
+                    "list<FixedSizeList> (multivector), or "
                     f"1-dimensional FixedShapeTensorArray, got {field.type}"
                 )
+            _, value_type = vector_type
             if not (
-                pa.types.is_floating(field.type.value_type)
-                or pa.types.is_unsigned_integer(field.type.value_type)
+                pa.types.is_floating(value_type)
+                or pa.types.is_unsigned_integer(value_type)
             ):
                 raise TypeError(
                     f"Vector column {c} must have floating or unsigned integer "
-                    f"value type, got {field.type.value_type}"
+                    f"value type, got {value_type}"
                 )
 
         return column
+
+    def _vector_dimension(self, data_type):
+        vector_type = self._describe_vector_type(data_type)
+        if vector_type is not None:
+            return vector_type[0]
+        raise TypeError(
+            "Vector column must be FixedSizeListArray, "
+            "list<FixedSizeList> (multivector), or "
+            f"1-dimensional FixedShapeTensorArray, got {data_type}"
+        )
+
+    def _describe_vector_type(self, data_type):
+        if pa.types.is_fixed_size_list(data_type):
+            return data_type.list_size, data_type.value_type
+        if pa.types.is_list(data_type) and pa.types.is_fixed_size_list(
+            data_type.value_type
+        ):
+            return data_type.value_type.list_size, data_type.value_type.value_type
+        if isinstance(data_type, pa.FixedShapeTensorType) and len(data_type.shape) == 1:
+            return data_type.shape[0], data_type.value_type
+        return None
 
 
 @dataclass

@@ -14,6 +14,7 @@ and a CustomNamespace wrapper to verify Python-Rust binding works correctly for
 custom namespace implementations.
 """
 
+import subprocess
 import sys
 import tempfile
 import uuid
@@ -27,8 +28,11 @@ import pytest
 from lance.namespace import LanceNamespace
 from lance_namespace import (
     CountTableRowsRequest,
+    CountTableRowsResponse,
     CreateNamespaceRequest,
     CreateNamespaceResponse,
+    CreateTableBranchRequest,
+    CreateTableBranchResponse,
     CreateTableIndexRequest,
     CreateTableIndexResponse,
     CreateTableRequest,
@@ -37,6 +41,8 @@ from lance_namespace import (
     CreateTableVersionResponse,
     DeclareTableRequest,
     DeclareTableResponse,
+    DeleteTableBranchRequest,
+    DeleteTableBranchResponse,
     DeregisterTableRequest,
     DeregisterTableResponse,
     DescribeNamespaceRequest,
@@ -54,6 +60,8 @@ from lance_namespace import (
     InsertIntoTableResponse,
     ListNamespacesRequest,
     ListNamespacesResponse,
+    ListTableBranchesRequest,
+    ListTableBranchesResponse,
     ListTableIndicesRequest,
     ListTableIndicesResponse,
     ListTablesRequest,
@@ -61,16 +69,21 @@ from lance_namespace import (
     ListTableVersionsRequest,
     ListTableVersionsResponse,
     NamespaceExistsRequest,
+    NamespaceExistsResponse,
     QueryTableRequest,
+    QueryTableResponse,
     RegisterTableRequest,
     RegisterTableResponse,
     TableExistsRequest,
+    TableExistsResponse,
     connect,
 )
 from lance_namespace.errors import (
     InvalidInputError,
     NamespaceNotEmptyError,
     NamespaceNotFoundError,
+    TableBranchAlreadyExistsError,
+    TableBranchNotFoundError,
     TableNotFoundError,
 )
 
@@ -99,7 +112,9 @@ class CustomNamespace(LanceNamespace):
     ) -> DescribeNamespaceResponse:
         return self._inner.describe_namespace(request)
 
-    def namespace_exists(self, request: NamespaceExistsRequest) -> None:
+    def namespace_exists(
+        self, request: NamespaceExistsRequest
+    ) -> NamespaceExistsResponse:
         return self._inner.namespace_exists(request)
 
     def drop_namespace(self, request: DropNamespaceRequest) -> DropNamespaceResponse:
@@ -119,7 +134,7 @@ class CustomNamespace(LanceNamespace):
     def describe_table(self, request: DescribeTableRequest) -> DescribeTableResponse:
         return self._inner.describe_table(request)
 
-    def table_exists(self, request: TableExistsRequest) -> None:
+    def table_exists(self, request: TableExistsRequest) -> TableExistsResponse:
         return self._inner.table_exists(request)
 
     def drop_table(self, request: DropTableRequest) -> DropTableResponse:
@@ -151,6 +166,21 @@ class CustomNamespace(LanceNamespace):
     ) -> CreateTableVersionResponse:
         return self._inner.create_table_version(request)
 
+    def create_table_branch(
+        self, request: CreateTableBranchRequest
+    ) -> CreateTableBranchResponse:
+        return self._inner.create_table_branch(request)
+
+    def list_table_branches(
+        self, request: ListTableBranchesRequest
+    ) -> ListTableBranchesResponse:
+        return self._inner.list_table_branches(request)
+
+    def delete_table_branch(
+        self, request: DeleteTableBranchRequest
+    ) -> DeleteTableBranchResponse:
+        return self._inner.delete_table_branch(request)
+
     def create_table_index(
         self, request: CreateTableIndexRequest
     ) -> CreateTableIndexResponse:
@@ -161,7 +191,9 @@ class CustomNamespace(LanceNamespace):
     ) -> ListTableIndicesResponse:
         return self._inner.list_table_indices(request)
 
-    def count_table_rows(self, request: CountTableRowsRequest) -> int:
+    def count_table_rows(
+        self, request: CountTableRowsRequest
+    ) -> CountTableRowsResponse:
         return self._inner.count_table_rows(request)
 
     def insert_into_table(
@@ -169,7 +201,7 @@ class CustomNamespace(LanceNamespace):
     ) -> InsertIntoTableResponse:
         return self._inner.insert_into_table(request, request_data)
 
-    def query_table(self, request) -> bytes:
+    def query_table(self, request) -> QueryTableResponse:
         # Accept both QueryTableRequest and dict, like DirectoryNamespace does
         if hasattr(request, "model_dump"):
             request = request.model_dump()
@@ -564,6 +596,110 @@ class TestTableOperations:
         assert "Path traversal is not allowed" in str(exc_info.value)
 
 
+class TestTableBranchOperations:
+    """Branch CRUD through the python bindings - mirrors the Rust branch
+    CRUD tests."""
+
+    def test_branch_crud_round_trip(self, temp_ns_client):
+        create_ns_req = CreateNamespaceRequest(id=["workspace"])
+        temp_ns_client.create_namespace(create_ns_req)
+        ipc_data = table_to_ipc_bytes(create_test_data())
+        table_id = ["workspace", "branched_table"]
+        temp_ns_client.create_table(CreateTableRequest(id=table_id), ipc_data)
+
+        temp_ns_client.create_table_branch(
+            CreateTableBranchRequest(id=table_id, name="dev")
+        )
+        listed = temp_ns_client.list_table_branches(
+            ListTableBranchesRequest(id=table_id)
+        )
+        assert "dev" in listed.branches
+        assert listed.branches["dev"].parent_version == 1
+
+        # Duplicate creation and deleting a missing branch surface the typed
+        # branch errors (codes 23 and 22), not InternalError.
+        temp_ns_client.create_table_branch(
+            CreateTableBranchRequest(id=table_id, name="dev2")
+        )
+        with pytest.raises(TableBranchAlreadyExistsError):
+            temp_ns_client.create_table_branch(
+                CreateTableBranchRequest(id=table_id, name="dev2")
+            )
+
+        temp_ns_client.delete_table_branch(
+            DeleteTableBranchRequest(id=table_id, name="dev")
+        )
+        listed = temp_ns_client.list_table_branches(
+            ListTableBranchesRequest(id=table_id)
+        )
+        assert "dev" not in listed.branches
+        with pytest.raises(TableBranchNotFoundError):
+            temp_ns_client.delete_table_branch(
+                DeleteTableBranchRequest(id=table_id, name="dev")
+            )
+
+    def test_create_branch_from_other_branch(self, temp_ns_client):
+        """Forking from a non-main source branch records the right parent."""
+        create_ns_req = CreateNamespaceRequest(id=["workspace"])
+        temp_ns_client.create_namespace(create_ns_req)
+        ipc_data = table_to_ipc_bytes(create_test_data())
+        table_id = ["workspace", "fork_table"]
+        temp_ns_client.create_table(CreateTableRequest(id=table_id), ipc_data)
+
+        temp_ns_client.create_table_branch(
+            CreateTableBranchRequest(id=table_id, name="dev")
+        )
+        temp_ns_client.create_table_branch(
+            CreateTableBranchRequest(id=table_id, name="child", from_branch="dev")
+        )
+        listed = temp_ns_client.list_table_branches(
+            ListTableBranchesRequest(id=table_id)
+        )
+        assert listed.branches["child"].parent_branch == "dev"
+
+
+class _ForeignCodeError(Exception):
+    """Not a LanceNamespaceError, but carries the same integer code as
+    TABLE_NOT_FOUND."""
+
+    code = 4
+
+
+class _RaisingNamespace(LanceNamespace):
+    """A namespace whose describe_table raises the configured exception."""
+
+    def __init__(self, exc: Exception):
+        self._exc = exc
+
+    def namespace_id(self) -> str:
+        return "raising"
+
+    def describe_table(self, request: DescribeTableRequest) -> DescribeTableResponse:
+        raise self._exc
+
+
+class TestPythonNamespaceErrorMapping:
+    """The Rust adapter must trust the `code` attribute only on the
+    lance_namespace exception hierarchy."""
+
+    def test_namespace_error_identity_preserved(self):
+        ns = _RaisingNamespace(TableNotFoundError("no such table"))
+        with pytest.raises(TableNotFoundError, match="no such table"):
+            lance.dataset(namespace_client=ns, table_id=["t"])
+
+        # Branch error codes (22/23) survive the round trip too.
+        ns = _RaisingNamespace(TableBranchNotFoundError("no such branch"))
+        with pytest.raises(TableBranchNotFoundError, match="no such branch"):
+            lance.dataset(namespace_client=ns, table_id=["t"])
+
+    def test_foreign_code_attribute_not_trusted(self):
+        # The foreign exception must surface as itself, not be reinterpreted
+        # as a namespace error via its `code` attribute.
+        ns = _RaisingNamespace(_ForeignCodeError("boom"))
+        with pytest.raises(_ForeignCodeError, match="boom"):
+            lance.dataset(namespace_client=ns, table_id=["t"])
+
+
 class TestChildNamespaceOperations:
     """Tests for operations in child namespaces - mirrors Rust tests."""
 
@@ -625,6 +761,16 @@ class TestChildNamespaceOperations:
         # Verify table exists
         exists_req = TableExistsRequest(id=["test_ns", "declared_table"])
         memory_ns_client.table_exists(exists_req)
+
+        describe_req = DescribeTableRequest(id=["test_ns", "declared_table"])
+        describe_resp = memory_ns_client.describe_table(describe_req)
+        assert describe_resp.is_only_declared is None
+
+        describe_req = DescribeTableRequest(
+            id=["test_ns", "declared_table"], check_declared=True
+        )
+        describe_resp = memory_ns_client.describe_table(describe_req)
+        assert describe_resp.is_only_declared is True
 
 
 class TestDeeplyNestedNamespaces:
@@ -815,6 +961,7 @@ class TestLanceNamespaceConnect:
             "root": f"memory://test_connect_{unique_id}",
             "manifest_enabled": "true",
             "dir_listing_enabled": "true",
+            "dir_listing_to_manifest_migration_enabled": "true",
         }
 
         # Connect via lance.namespace.connect
@@ -870,10 +1017,6 @@ def _get_ops_metric(ns_client, metric_name: str) -> int:
     return metrics.get(metric_name, 0)
 
 
-@pytest.mark.skipif(
-    sys.platform == "win32",
-    reason="External manifest store has known issues on Windows",
-)
 @pytest.mark.parametrize("use_custom", [False, True], ids=["DirectoryNS", "CustomNS"])
 def test_external_manifest_store_invokes_namespace_apis(use_custom):
     """Test that namespace APIs are invoked correctly for managed versioning.
@@ -970,6 +1113,49 @@ def test_external_manifest_store_invokes_namespace_apis(use_custom):
             _get_ops_metric(inner_ns_client, "describe_table_version")
             == describe_count_before_v1 + 1
         ), "describe_table_version should be called once when opening version 1"
+
+
+def test_dataset_namespace_open_does_not_pass_version_to_describe_table():
+    """Dataset versions are applied to dataset open, not namespace describe_table."""
+
+    class VersionRejectingNamespace(CustomNamespace):
+        def __init__(self, inner: lance.namespace.DirectoryNamespace):
+            super().__init__(inner)
+            self.describe_versions = []
+
+        def describe_table(
+            self, request: DescribeTableRequest
+        ) -> DescribeTableResponse:
+            self.describe_versions.append(request.version)
+            assert request.version is None
+            return super().describe_table(request)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        inner_ns_client = lance.namespace.DirectoryNamespace(root=tmpdir)
+        ns_client = VersionRejectingNamespace(inner_ns_client)
+        table_id = ["test_table"]
+
+        table1 = pa.Table.from_pylist([{"a": 1}, {"a": 2}])
+        ds = lance.write_dataset(
+            table1, namespace_client=ns_client, table_id=table_id, mode="create"
+        )
+        assert ds.count_rows() == 2
+        assert ds.version == 1
+
+        table2 = pa.Table.from_pylist([{"a": 3}])
+        ds = lance.write_dataset(
+            table2, namespace_client=ns_client, table_id=table_id, mode="append"
+        )
+        assert ds.count_rows() == 3
+        assert ds.version == 2
+
+        version_one = lance.dataset(
+            namespace_client=ns_client, table_id=table_id, version=1
+        )
+        assert version_one.count_rows() == 2
+        assert version_one.version == 1
+        assert ns_client.describe_versions
+        assert all(version is None for version in ns_client.describe_versions)
 
 
 @pytest.mark.skipif(
@@ -1239,7 +1425,7 @@ class TestDataManipulation:
 
         # Count rows
         count_req = CountTableRowsRequest(id=["workspace", "test_table"])
-        count = temp_ns_client.count_table_rows(count_req)
+        count = temp_ns_client.count_table_rows(count_req).count
         assert count == 3
 
     def test_count_table_rows_with_filter(self, temp_ns_client):
@@ -1257,7 +1443,7 @@ class TestDataManipulation:
         count_req = CountTableRowsRequest(
             id=["workspace", "test_table"], predicate="age > 28"
         )
-        count = temp_ns_client.count_table_rows(count_req)
+        count = temp_ns_client.count_table_rows(count_req).count
         assert count == 2  # Alice (30) and Charlie (35)
 
     def test_insert_into_table(self, temp_ns_client):
@@ -1287,7 +1473,7 @@ class TestDataManipulation:
 
         # Verify row count increased
         count_req = CountTableRowsRequest(id=["workspace", "test_table"])
-        count = temp_ns_client.count_table_rows(count_req)
+        count = temp_ns_client.count_table_rows(count_req).count
         assert count == 5
 
     def test_query_table(self, temp_ns_client):
@@ -1303,7 +1489,7 @@ class TestDataManipulation:
 
         # Query table with empty vector (for non-vector queries)
         query_req = QueryTableRequest(id=["workspace", "test_table"], k=10, vector={})
-        result_bytes = temp_ns_client.query_table(query_req)
+        result_bytes = temp_ns_client.query_table(query_req).data
         assert result_bytes is not None
         assert len(result_bytes) > 0
 
@@ -1329,16 +1515,12 @@ class TestDataManipulation:
         query_req = QueryTableRequest(
             id=["workspace", "test_table"], filter="age >= 30", k=10, vector={}
         )
-        result_bytes = temp_ns_client.query_table(query_req)
+        result_bytes = temp_ns_client.query_table(query_req).data
         reader = pa.ipc.open_file(pa.BufferReader(result_bytes))
         result_table = reader.read_all()
         assert result_table.num_rows == 2  # Alice and Charlie
 
 
-@pytest.mark.skipif(
-    sys.platform == "win32",
-    reason="Table version listing not supported on Windows",
-)
 class TestTableVersions:
     """Tests for table version operations."""
 
@@ -1515,3 +1697,16 @@ class TestIndexOperations:
         assert len(list_response.indexes) == 1
         assert list_response.indexes[0].index_name == "vector_idx"
         assert list_response.indexes[0].columns == ["vector"]
+
+
+def test_import_lance_does_not_load_namespace_client():
+    # The generated REST client is expensive to import and only needed when a
+    # namespace is actually used, so `import lance` must not pull it in.
+    code = (
+        "import sys, lance; "
+        "assert 'lance_namespace' not in sys.modules, sorted(sys.modules); "
+        "assert 'lance.namespace' not in sys.modules; "
+        "lance.LanceNamespace; lance.DescribeTableRequest; "
+        "assert 'lance_namespace' in sys.modules"
+    )
+    subprocess.run([sys.executable, "-c", code], check=True)

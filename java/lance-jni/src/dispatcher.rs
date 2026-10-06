@@ -23,25 +23,30 @@ pub struct Dispatcher {
 }
 
 impl Dispatcher {
-    /// Initialize the dispatcher with a persistent JNI thread
-    pub fn initialize(jvm: Arc<JavaVM>) -> Arc<Self> {
+    /// Initialize the dispatcher with a persistent JNI thread.
+    ///
+    /// `async_scanner_class` must be a `GlobalRef` to the `AsyncScanner`
+    /// Java class, resolved on a thread that has the correct application
+    /// classloader (typically the `JNI_OnLoad` thread).
+    pub fn initialize(jvm: Arc<JavaVM>, async_scanner_class: GlobalRef) -> Arc<Self> {
         let (tx, mut rx) = mpsc::unbounded_channel::<DispatcherMessage>();
 
         // Spawn persistent dispatcher thread
         std::thread::Builder::new()
             .name("lance-jni-dispatcher".to_string())
             .spawn(move || {
-                // Attach ONCE and never detach - this is the key optimization
+                // Attach as daemon thread so it won't prevent JVM from exiting.
+                // The thread stays attached for the entire lifetime (never detach),
+                // but being a daemon thread means JVM won't wait for it on shutdown.
                 let mut env = jvm
-                    .attach_current_thread_permanently()
+                    .attach_current_thread_as_daemon()
                     .expect("Failed to attach dispatcher to JVM");
 
                 log::info!("JNI dispatcher thread started");
 
-                // Cache method IDs for completeTask and failTask
-                let async_scanner_class = env
-                    .find_class("org/lance/ipc/AsyncScanner")
-                    .expect("AsyncScanner class not found");
+                // Cache method IDs for completeTask and failTask.
+                // Use the pre-resolved GlobalRef instead of find_class to
+                // avoid classloader issues on this native thread.
                 let complete_method = env
                     .get_method_id(&async_scanner_class, "completeTask", "(JJ)V")
                     .expect("completeTask method not found");

@@ -4,10 +4,15 @@
 //! Vector Index for Fast Approximate Nearest Neighbor (ANN) Search
 //!
 
+use lance_index::scalar::RowAddrTranslator;
 use std::sync::Arc;
 use std::{any::Any, collections::HashMap};
 
+mod bounded_partition_stream;
 pub mod builder;
+pub mod dedup;
+pub(crate) mod details;
+pub mod hamming;
 pub mod ivf;
 mod partition_artifact;
 pub mod pq;
@@ -17,19 +22,22 @@ pub mod utils;
 mod fixture_test;
 
 use self::{ivf::*, pq::PQIndex};
+use arrow_array::Array;
+use arrow_array::cast::AsArray;
 use arrow_schema::{DataType, Schema};
-use builder::IvfIndexBuilder;
+use builder::{IvfIndexBuilder, VectorIndexBuildSummary};
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use futures::TryStreamExt;
 use futures::stream;
 use lance_core::utils::tempfile::TempStdDir;
-use lance_file::previous::reader::FileReader as PreviousFileReader;
-use lance_index::frag_reuse::FragReuseIndex;
+use lance_file::versions::v1::reader::FileReader as V1FileReader;
+use lance_index::frag_reuse::CompactFragReuseIndex;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::progress::{IndexBuildProgress, noop_progress};
 use lance_index::vector::bq::builder::RabitQuantizer;
-use lance_index::vector::bq::{RQBuildParams, RQRotationType};
+use lance_index::vector::bq::{RQBuildParams, RQRotationType, validate_supported_rq_num_bits};
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::ivf::builder::recommended_num_partitions;
@@ -53,15 +61,16 @@ use lance_index::vector::{
     sq::{ScalarQuantizer, builder::SQBuildParams},
 };
 use lance_index::{INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY, IndexType};
+use lance_io::object_store::ObjectStore;
 use lance_io::traits::Reader;
 use lance_linalg::distance::*;
-use lance_table::format::{IndexMetadata, list_index_files_with_sizes};
+use lance_table::format::{IndexFile, IndexMetadata};
 use serde::Serialize;
 use tracing::instrument;
 use utils::get_vector_type;
 use uuid::Uuid;
 
-use super::{DatasetIndexExt, DatasetIndexInternalExt, IndexParams, pb, vector_index_details};
+use super::{DatasetIndexExt, DatasetIndexInternalExt, IndexParams, pb};
 use crate::dataset::index::dataset_format_version;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::{Error, Result, dataset::Dataset, index::pb::vector_index_stage::Stage};
@@ -267,6 +276,11 @@ pub struct VectorIndexParams {
 
     /// Skip transpose / packing for PQ and RQ storage.
     pub skip_transpose: bool,
+
+    /// Runtime hints: optional build preferences stored in the index manifest.
+    /// Keys use reverse-DNS namespacing (e.g., "lance.ivf.max_iters").
+    /// Populated by the build path and merged into VectorIndexDetails at creation time.
+    pub runtime_hints: HashMap<String, String>,
 }
 
 impl VectorIndexParams {
@@ -288,6 +302,7 @@ impl VectorIndexParams {
             metric_type,
             version: IndexFileVersion::V3,
             skip_transpose: false,
+            runtime_hints: HashMap::new(),
         }
     }
 
@@ -298,6 +313,7 @@ impl VectorIndexParams {
             metric_type,
             version: IndexFileVersion::V3,
             skip_transpose: false,
+            runtime_hints: HashMap::new(),
         }
     }
 
@@ -332,6 +348,7 @@ impl VectorIndexParams {
             metric_type,
             version: IndexFileVersion::V3,
             skip_transpose: false,
+            runtime_hints: HashMap::new(),
         }
     }
 
@@ -358,6 +375,7 @@ impl VectorIndexParams {
             metric_type: distance_type,
             version: IndexFileVersion::V3,
             skip_transpose: false,
+            runtime_hints: HashMap::new(),
         }
     }
 
@@ -373,6 +391,7 @@ impl VectorIndexParams {
             metric_type,
             version: IndexFileVersion::V3,
             skip_transpose: false,
+            runtime_hints: HashMap::new(),
         }
     }
 
@@ -387,6 +406,7 @@ impl VectorIndexParams {
             metric_type,
             version: IndexFileVersion::V3,
             skip_transpose: false,
+            runtime_hints: HashMap::new(),
         }
     }
 
@@ -401,6 +421,7 @@ impl VectorIndexParams {
             metric_type,
             version: IndexFileVersion::V3,
             skip_transpose: false,
+            runtime_hints: HashMap::new(),
         }
     }
 
@@ -415,6 +436,7 @@ impl VectorIndexParams {
             metric_type: distance_type,
             version: IndexFileVersion::V3,
             skip_transpose: false,
+            runtime_hints: HashMap::new(),
         }
     }
 
@@ -436,6 +458,7 @@ impl VectorIndexParams {
             metric_type,
             version: IndexFileVersion::V3,
             skip_transpose: false,
+            runtime_hints: HashMap::new(),
         }
     }
 
@@ -457,6 +480,7 @@ impl VectorIndexParams {
             metric_type,
             version: IndexFileVersion::V3,
             skip_transpose: false,
+            runtime_hints: HashMap::new(),
         }
     }
 
@@ -486,12 +510,180 @@ impl IndexParams for VectorIndexParams {
     }
 }
 
+/// Whether `column` holds at least `minimum` vectors to train a quantizer from.
+///
+/// The metadata-only row total settles anything already short of the floor, so
+/// the validity count runs only where its answer can change the verdict.
+pub async fn has_vectors_to_train(dataset: &Dataset, column: &str, minimum: usize) -> Result<bool> {
+    let total = dataset.count_rows(None).await?;
+    if total < minimum && !is_multivector(dataset, column)? {
+        return Ok(false);
+    }
+    Ok(count_trainable_vectors(dataset, column, total, minimum).await? >= minimum)
+}
+
+/// Vectors in `column` available to train from.
+///
+/// A multivector row holds a list, so its rows bound the vectors from neither
+/// side — ten rows can carry a thousand, and an empty list carries none. Those
+/// are summed from the lists themselves; everything else counts the rows that
+/// hold a vector. Both callers compare the count with a threshold, so `enough`
+/// stops the walk as soon as the answer is settled.
+pub(crate) async fn count_trainable_vectors(
+    dataset: &Dataset,
+    column: &str,
+    total_rows: usize,
+    enough: usize,
+) -> Result<usize> {
+    if !is_multivector(dataset, column)? {
+        return count_non_null_vectors(dataset, column, total_rows).await;
+    }
+
+    let mut scanner = dataset.scan();
+    scanner.project(&[column])?;
+    let mut batches = scanner.try_into_stream().await?;
+    let mut vectors = 0_usize;
+    while let Some(batch) = batches.try_next().await? {
+        let lists = utils::get_column_from_batch(&batch, column)?;
+        let lists = lists.as_list::<i32>();
+        for row in 0..lists.len() {
+            if lists.is_null(row) {
+                continue;
+            }
+            // A vector inside the row can be null, and is not one to train on.
+            let row_vectors = lists.value(row);
+            vectors = vectors.saturating_add(row_vectors.len() - row_vectors.null_count());
+        }
+        if vectors >= enough {
+            return Ok(vectors);
+        }
+    }
+    Ok(vectors)
+}
+
+fn is_multivector(dataset: &Dataset, column: &str) -> Result<bool> {
+    let (vector_type, _) = get_vector_type(dataset.schema(), column)?;
+    Ok(matches!(vector_type, DataType::List(_)))
+}
+
+/// Count the rows of `column` holding a vector.
+///
+/// A column that cannot hold nulls has one per row, so `total_rows` is the
+/// answer and nothing is read.
+async fn count_non_null_vectors(
+    dataset: &Dataset,
+    column: &str,
+    total_rows: usize,
+) -> Result<usize> {
+    let nullable = dataset
+        .schema()
+        .field(column)
+        .is_none_or(|field| field.nullable);
+    if !nullable {
+        return Ok(total_rows);
+    }
+
+    dataset
+        .count_rows(Some(format!("{column} IS NOT NULL")))
+        .await
+}
+
+/// The partition count a whole-table build can train.
+///
+/// A partition's centroid is what search ranks to choose partitions, so one
+/// built from a handful of vectors prunes nothing while still paying the
+/// quantizer's precision loss. The vectors available therefore cap the count,
+/// at `vectors_per_partition` each.
+async fn supported_num_partitions(
+    dataset: &Dataset,
+    column: &str,
+    stages: &[StageParams],
+    requested: usize,
+    mode: &str,
+) -> Result<usize> {
+    let total = dataset.count_rows(None).await?;
+    let enough = vectors_for_partitions(stages, requested);
+    let vectors = count_trainable_vectors(dataset, column, total, enough).await?;
+    if vectors >= enough {
+        return Ok(requested);
+    }
+
+    let supported = match vectors_per_partition(stages) {
+        Some(target) => requested.min(recommended_num_partitions(vectors, target)),
+        None => requested.min(vectors).max(1),
+    };
+    if supported < requested {
+        log::warn!(
+            "{mode}: training {supported} of the {requested} requested IVF partitions; \
+             column '{column}' holds {vectors} vectors"
+        );
+    }
+    Ok(supported)
+}
+
+/// Vectors needed before `partitions` can each train a quantizer of their own.
+///
+/// The upper edge of the reduced-partition band: below this a build trains
+/// fewer partitions than asked for.
+fn vectors_for_partitions(stages: &[StageParams], partitions: usize) -> usize {
+    partitions.saturating_mul(vectors_per_partition(stages).unwrap_or(1))
+}
+
+/// The vectors one partition's centroid should be fitted on, or `None` when the
+/// index stores vectors uncompressed.
+///
+/// A codebook's precision loss is paid on every vector, so a centroid fitted on
+/// a handful prunes nothing and still costs it. Without a codebook there is no
+/// precision to lose, and KMeans needing a vector per centroid is the only
+/// limit.
+fn vectors_per_partition(stages: &[StageParams]) -> Option<usize> {
+    vector_quantizer_minimum_rows(stages)?;
+    // IVF training fits each centroid on `sample_rate` vectors, which is also
+    // where KMeans starts warning (`k * 256` at the default rate). That number
+    // belongs to the IVF stage: an 8-bit codebook holds the same 256 entries by
+    // coincidence, and a 4-bit one asking only 16 vectors per partition would
+    // train centroids that prune nothing.
+    Some(
+        stages
+            .iter()
+            .find_map(|stage| match stage {
+                StageParams::Ivf(ivf) => Some(ivf.sample_rate),
+                _ => None,
+            })
+            .unwrap_or_else(|| IvfBuildParams::default().sample_rate)
+            .max(1),
+    )
+}
+
+/// Rows a PQ codebook needs before it can be trained.
+///
+/// One row per code, which is `2^num_bits` — 256 at the default 8 bits, and not
+/// 256 at any other setting. `None` when the width does not fit a `usize`.
+pub fn pq_quantizer_minimum_rows(num_bits: usize) -> Option<usize> {
+    1_usize.checked_shl(num_bits as u32)
+}
+
+/// Rows a vector index's quantizer needs before it can be trained.
+///
+/// `None` for an index type whose stages name no quantizer with a row floor.
+pub(crate) fn vector_quantizer_minimum_rows(stages: &[StageParams]) -> Option<usize> {
+    stages.iter().find_map(|stage| match stage {
+        // A supplied codebook is what training would have produced, so the
+        // build needs no vectors to fit one.
+        StageParams::PQ(pq) if pq.codebook.is_none() => pq_quantizer_minimum_rows(pq.num_bits),
+        _ => None,
+    })
+}
+
 /// Prepare the shared build inputs used by both direct local builds and
 /// staged shard builds.
 ///
 /// These paths emit different file layouts, but they follow the same rules for
 /// validating the vector column, deriving the effective index type, sizing IVF
 /// partitions, and constructing the shuffler.
+///
+/// The shuffler carries only the path of its scratch directory, so the returned
+/// [`TempStdDir`] guard owns that directory: hold it until the build finishes.
 async fn prepare_vector_segment_build(
     dataset: &Dataset,
     column: &str,
@@ -499,7 +691,14 @@ async fn prepare_vector_segment_build(
     progress: Arc<dyn IndexBuildProgress>,
     mode: &str,
     require_precomputed_ivf: bool,
-) -> Result<(DataType, IndexType, IvfBuildParams, Box<dyn Shuffler>)> {
+    fragment_ids: Option<&[u32]>,
+) -> Result<(
+    DataType,
+    IndexType,
+    IvfBuildParams,
+    Box<dyn Shuffler>,
+    TempStdDir,
+)> {
     let stages = &params.stages;
 
     if stages.is_empty() {
@@ -529,16 +728,51 @@ async fn prepare_vector_segment_build(
         )));
     }
 
-    let num_rows = dataset.count_rows(None).await?;
     let index_type = params.index_type();
-    let num_partitions = ivf_params0.num_partitions.unwrap_or_else(|| {
-        recommended_num_partitions(
-            num_rows,
-            ivf_params0
-                .target_partition_size
-                .unwrap_or(index_type.target_partition_size()),
-        )
-    });
+    if index_type == IndexType::IvfRq {
+        let Some(StageParams::RQ(rq_params)) = stages.last() else {
+            return Err(Error::index(format!(
+                "{mode}: invalid stages: {:?}",
+                stages
+            )));
+        };
+        validate_supported_rq_num_bits(rq_params.num_bits)?;
+    }
+
+    let num_partitions = match (ivf_params0.num_partitions, ivf_params0.centroids.as_ref()) {
+        (Some(num_partitions), Some(centroids)) if num_partitions != centroids.len() => {
+            return Err(Error::index(format!(
+                "{mode}: num_partitions {} does not match precomputed IVF centroids length {}",
+                num_partitions,
+                centroids.len()
+            )));
+        }
+        (Some(num_partitions), Some(_)) => num_partitions,
+        // A partition's centroid is what search ranks to choose partitions, so
+        // one built from a handful of vectors prunes nothing and still costs
+        // the quantizer's precision. So the vectors available cap how many
+        // partitions a whole-table build trains, at the IVF sample rate each.
+        //
+        // A fragment subset keeps the count it was given: the segments of one
+        // logical index have to agree on it.
+        (Some(requested), None) if fragment_ids.is_none() => {
+            supported_num_partitions(dataset, column, stages, requested, mode).await?
+        }
+        (Some(num_partitions), None) => num_partitions,
+        (None, Some(centroids)) => centroids.len(),
+        (None, None) => {
+            let num_rows = match fragment_ids {
+                Some(fragment_ids) => dataset.count_rows_in_fragments(fragment_ids).await?,
+                None => dataset.count_rows(None).await?,
+            };
+            recommended_num_partitions(
+                num_rows,
+                ivf_params0
+                    .target_partition_size
+                    .unwrap_or(index_type.target_partition_size()),
+            )
+        }
+    };
     let mut ivf_params = ivf_params0.clone();
     ivf_params.num_partitions = Some(num_partitions);
 
@@ -552,7 +786,7 @@ async fn prepare_vector_segment_build(
         Some(progress),
     );
 
-    Ok((element_type, index_type, ivf_params, shuffler))
+    Ok((element_type, index_type, ivf_params, shuffler, temp_dir))
 }
 
 /// Build a Distributed Vector Index for specific fragments
@@ -562,21 +796,23 @@ pub(crate) async fn build_distributed_vector_index(
     dataset: &Dataset,
     column: &str,
     _name: &str,
-    uuid: &str,
+    uuid: Uuid,
     params: &VectorIndexParams,
-    frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
     fragment_ids: &[u32],
     progress: Arc<dyn IndexBuildProgress>,
-) -> Result<Uuid> {
-    let (element_type, index_type, ivf_params, shuffler) = prepare_vector_segment_build(
-        dataset,
-        column,
-        params,
-        progress.clone(),
-        "Build Distributed Vector Index",
-        true,
-    )
-    .await?;
+) -> Result<(Uuid, Vec<IndexFile>)> {
+    let (element_type, index_type, ivf_params, shuffler, _shuffle_temp_dir) =
+        prepare_vector_segment_build(
+            dataset,
+            column,
+            params,
+            progress.clone(),
+            "Build Distributed Vector Index",
+            true,
+            Some(fragment_ids),
+        )
+        .await?;
     let stages = &params.stages;
 
     let ivf_centroids = ivf_params
@@ -588,9 +824,8 @@ pub(crate) async fn build_distributed_vector_index(
 
     let filtered_dataset = dataset.clone();
 
-    let segment_uuid = Uuid::parse_str(uuid)
-        .map_err(|err| Error::invalid_input(format!("Invalid index UUID '{uuid}': {err}")))?;
-    let index_dir = dataset.indices_dir().child(segment_uuid.to_string());
+    let segment_uuid = uuid;
+    let index_dir = dataset.indices_dir().join(segment_uuid.to_string());
 
     let fragment_filter = fragment_ids.to_vec();
 
@@ -612,6 +847,12 @@ pub(crate) async fn build_distributed_vector_index(
             .codebook
             .clone()
             .expect("checked above that PQ codebook is present");
+        lance_index::vector::pq::validate_supplied_codebook(
+            pre_codebook.len(),
+            dim,
+            pq_params.num_sub_vectors,
+            pq_params.num_bits,
+        )?;
         let codebook_fsl =
             arrow_array::FixedSizeListArray::try_new_from_values(pre_codebook, dim as i32)?;
 
@@ -633,7 +874,7 @@ pub(crate) async fn build_distributed_vector_index(
             DataType::Float16 | DataType::Float32 | DataType::Float64 => {
                 let ivf_model = make_ivf_model();
 
-                IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new(
+                let summary = IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new(
                     filtered_dataset,
                     column.to_owned(),
                     index_dir.clone(),
@@ -649,11 +890,12 @@ pub(crate) async fn build_distributed_vector_index(
                 .with_progress(progress.clone())
                 .build()
                 .await?;
+                return Ok((segment_uuid, summary.files));
             }
             DataType::UInt8 => {
                 let ivf_model = make_ivf_model();
 
-                IvfIndexBuilder::<FlatIndex, FlatBinQuantizer>::new(
+                let summary = IvfIndexBuilder::<FlatIndex, FlatBinQuantizer>::new(
                     filtered_dataset,
                     column.to_owned(),
                     index_dir.clone(),
@@ -669,6 +911,7 @@ pub(crate) async fn build_distributed_vector_index(
                 .with_progress(progress.clone())
                 .build()
                 .await?;
+                return Ok((segment_uuid, summary.files));
             }
             _ => {
                 return Err(Error::index(format!(
@@ -697,7 +940,7 @@ pub(crate) async fn build_distributed_vector_index(
                     let ivf_model = make_ivf_model();
                     let global_pq = make_global_pq(pq_params)?;
 
-                    IvfIndexBuilder::<FlatIndex, ProductQuantizer>::new(
+                    let summary = IvfIndexBuilder::<FlatIndex, ProductQuantizer>::new(
                         filtered_dataset,
                         column.to_owned(),
                         index_dir.clone(),
@@ -717,6 +960,7 @@ pub(crate) async fn build_distributed_vector_index(
                     .with_progress(progress.clone())
                     .build()
                     .await?;
+                    return Ok((segment_uuid, summary.files));
                 }
             }
         }
@@ -728,7 +972,7 @@ pub(crate) async fn build_distributed_vector_index(
                     stages
                 )));
             };
-            IvfIndexBuilder::<FlatIndex, ScalarQuantizer>::new(
+            let summary = IvfIndexBuilder::<FlatIndex, ScalarQuantizer>::new(
                 filtered_dataset,
                 column.to_owned(),
                 index_dir.clone(),
@@ -743,6 +987,7 @@ pub(crate) async fn build_distributed_vector_index(
             .with_progress(progress.clone())
             .build()
             .await?;
+            return Ok((segment_uuid, summary.files));
         }
 
         IndexType::IvfHnswFlat => {
@@ -755,7 +1000,7 @@ pub(crate) async fn build_distributed_vector_index(
 
             match element_type {
                 DataType::UInt8 => {
-                    IvfIndexBuilder::<HNSW, FlatBinQuantizer>::new(
+                    let summary = IvfIndexBuilder::<HNSW, FlatBinQuantizer>::new(
                         filtered_dataset,
                         column.to_owned(),
                         index_dir.clone(),
@@ -770,9 +1015,10 @@ pub(crate) async fn build_distributed_vector_index(
                     .with_progress(progress.clone())
                     .build()
                     .await?;
+                    return Ok((segment_uuid, summary.files));
                 }
                 _ => {
-                    IvfIndexBuilder::<HNSW, FlatQuantizer>::new(
+                    let summary = IvfIndexBuilder::<HNSW, FlatQuantizer>::new(
                         filtered_dataset,
                         column.to_owned(),
                         index_dir.clone(),
@@ -787,6 +1033,7 @@ pub(crate) async fn build_distributed_vector_index(
                     .with_progress(progress.clone())
                     .build()
                     .await?;
+                    return Ok((segment_uuid, summary.files));
                 }
             }
         }
@@ -808,7 +1055,7 @@ pub(crate) async fn build_distributed_vector_index(
             let ivf_model = make_ivf_model();
             let global_pq = make_global_pq(pq_params)?;
 
-            IvfIndexBuilder::<HNSW, ProductQuantizer>::new(
+            let summary = IvfIndexBuilder::<HNSW, ProductQuantizer>::new(
                 filtered_dataset,
                 column.to_owned(),
                 index_dir.clone(),
@@ -828,6 +1075,7 @@ pub(crate) async fn build_distributed_vector_index(
             .with_progress(progress.clone())
             .build()
             .await?;
+            return Ok((segment_uuid, summary.files));
         }
 
         IndexType::IvfHnswSq => {
@@ -843,7 +1091,7 @@ pub(crate) async fn build_distributed_vector_index(
                     stages
                 )));
             };
-            IvfIndexBuilder::<HNSW, ScalarQuantizer>::new(
+            let summary = IvfIndexBuilder::<HNSW, ScalarQuantizer>::new(
                 filtered_dataset,
                 column.to_owned(),
                 index_dir.clone(),
@@ -858,6 +1106,7 @@ pub(crate) async fn build_distributed_vector_index(
             .with_progress(progress.clone())
             .build()
             .await?;
+            return Ok((segment_uuid, summary.files));
         }
 
         IndexType::IvfRq => {
@@ -870,7 +1119,7 @@ pub(crate) async fn build_distributed_vector_index(
 
             let ivf_model = make_ivf_model();
 
-            IvfIndexBuilder::<FlatIndex, RabitQuantizer>::new(
+            let summary = IvfIndexBuilder::<FlatIndex, RabitQuantizer>::new(
                 filtered_dataset,
                 column.to_owned(),
                 index_dir.clone(),
@@ -889,6 +1138,7 @@ pub(crate) async fn build_distributed_vector_index(
             .with_progress(progress.clone())
             .build()
             .await?;
+            return Ok((segment_uuid, summary.files));
         }
 
         _ => {
@@ -897,9 +1147,7 @@ pub(crate) async fn build_distributed_vector_index(
                 index_type
             )));
         }
-    };
-
-    Ok(segment_uuid)
+    }
 }
 
 /// Build a Vector Index
@@ -908,29 +1156,89 @@ pub(crate) async fn build_vector_index(
     dataset: &Dataset,
     column: &str,
     name: &str,
-    uuid: &str,
+    uuid: Uuid,
     params: &VectorIndexParams,
-    frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
     progress: Arc<dyn IndexBuildProgress>,
-) -> Result<()> {
-    let (element_type, index_type, ivf_params, shuffler) = prepare_vector_segment_build(
+) -> Result<Vec<IndexFile>> {
+    build_vector_index_impl(
         dataset,
         column,
+        name,
+        uuid,
         params,
-        progress.clone(),
-        "Build Vector Index",
-        false,
+        frag_reuse_index,
+        progress,
+        None,
     )
-    .await?;
+    .await
+}
+
+/// Build a standalone vector index segment over a subset of fragments.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn build_filtered_vector_index(
+    dataset: &Dataset,
+    column: &str,
+    name: &str,
+    uuid: Uuid,
+    params: &VectorIndexParams,
+    frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
+    fragment_ids: &[u32],
+    progress: Arc<dyn IndexBuildProgress>,
+) -> Result<Vec<IndexFile>> {
+    build_vector_index_impl(
+        dataset,
+        column,
+        name,
+        uuid,
+        params,
+        frag_reuse_index,
+        progress,
+        Some(fragment_ids),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn build_vector_index_impl(
+    dataset: &Dataset,
+    column: &str,
+    name: &str,
+    uuid: Uuid,
+    params: &VectorIndexParams,
+    frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
+    progress: Arc<dyn IndexBuildProgress>,
+    fragment_ids: Option<&[u32]>,
+) -> Result<Vec<IndexFile>> {
+    let (element_type, index_type, ivf_params, shuffler, _shuffle_temp_dir) =
+        prepare_vector_segment_build(
+            dataset,
+            column,
+            params,
+            progress.clone(),
+            "Build Vector Index",
+            false,
+            fragment_ids,
+        )
+        .await?;
     let stages = &params.stages;
+
+    // RaBitQ encodes against L2 or dot residuals, and its transform rejects
+    // anything else, but only after the IVF model has been trained on a sample.
+    if index_type == IndexType::IvfRq && params.metric_type == DistanceType::Hamming {
+        return Err(Error::index(format!(
+            "Build Vector Index: {} does not support the {} metric",
+            index_type, params.metric_type
+        )));
+    }
 
     match index_type {
         IndexType::IvfFlat => match element_type {
             DataType::Float16 | DataType::Float32 | DataType::Float64 => {
-                IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new(
+                let summary = IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new(
                     dataset.clone(),
                     column.to_owned(),
-                    dataset.indices_dir().child(uuid),
+                    dataset.indices_dir().clone().join(uuid.to_string()),
                     params.metric_type,
                     shuffler,
                     Some(ivf_params),
@@ -938,15 +1246,17 @@ pub(crate) async fn build_vector_index(
                     (),
                     frag_reuse_index,
                 )?
+                .with_optional_fragment_filter(fragment_ids)
                 .with_progress(progress.clone())
                 .build()
                 .await?;
+                Ok(summary.files)
             }
             DataType::UInt8 => {
-                IvfIndexBuilder::<FlatIndex, FlatBinQuantizer>::new(
+                let summary = IvfIndexBuilder::<FlatIndex, FlatBinQuantizer>::new(
                     dataset.clone(),
                     column.to_owned(),
-                    dataset.indices_dir().child(uuid),
+                    dataset.indices_dir().clone().join(uuid.to_string()),
                     params.metric_type,
                     shuffler,
                     Some(ivf_params),
@@ -954,16 +1264,16 @@ pub(crate) async fn build_vector_index(
                     (),
                     frag_reuse_index,
                 )?
+                .with_optional_fragment_filter(fragment_ids)
                 .with_progress(progress.clone())
                 .build()
                 .await?;
+                Ok(summary.files)
             }
-            _ => {
-                return Err(Error::index(format!(
-                    "Build Vector Index: invalid data type: {:?}",
-                    element_type
-                )));
-            }
+            _ => Err(Error::index(format!(
+                "Build Vector Index: invalid data type: {:?}",
+                element_type
+            ))),
         },
         IndexType::IvfPq => {
             let len = stages.len();
@@ -976,7 +1286,13 @@ pub(crate) async fn build_vector_index(
 
             match params.version {
                 IndexFileVersion::Legacy => {
-                    build_ivf_pq_index(
+                    if fragment_ids.is_some() {
+                        return Err(Error::index(
+                            "Build Vector Index: filtered IVF_PQ builds do not support legacy format"
+                                .to_string(),
+                        ));
+                    }
+                    let files = build_ivf_pq_index(
                         dataset,
                         column,
                         name,
@@ -987,12 +1303,13 @@ pub(crate) async fn build_vector_index(
                         progress.clone(),
                     )
                     .await?;
+                    Ok(files)
                 }
                 IndexFileVersion::V3 => {
                     let mut builder = IvfIndexBuilder::<FlatIndex, ProductQuantizer>::new(
                         dataset.clone(),
                         column.to_owned(),
-                        dataset.indices_dir().child(uuid),
+                        dataset.indices_dir().join(uuid.to_string()),
                         params.metric_type,
                         shuffler,
                         Some(ivf_params),
@@ -1001,11 +1318,13 @@ pub(crate) async fn build_vector_index(
                         frag_reuse_index,
                     )?;
 
-                    builder
+                    let summary = builder
                         .with_transpose(!params.skip_transpose)
+                        .with_optional_fragment_filter(fragment_ids)
                         .with_progress(progress.clone())
                         .build()
                         .await?;
+                    Ok(summary.files)
                 }
             }
         }
@@ -1017,10 +1336,10 @@ pub(crate) async fn build_vector_index(
                 )));
             };
 
-            IvfIndexBuilder::<FlatIndex, ScalarQuantizer>::new(
+            let summary = IvfIndexBuilder::<FlatIndex, ScalarQuantizer>::new(
                 dataset.clone(),
                 column.to_owned(),
-                dataset.indices_dir().child(uuid),
+                dataset.indices_dir().clone().join(uuid.to_string()),
                 params.metric_type,
                 shuffler,
                 Some(ivf_params),
@@ -1028,9 +1347,11 @@ pub(crate) async fn build_vector_index(
                 (),
                 frag_reuse_index,
             )?
+            .with_optional_fragment_filter(fragment_ids)
             .with_progress(progress.clone())
             .build()
             .await?;
+            Ok(summary.files)
         }
         IndexType::IvfRq => {
             let StageParams::RQ(rq_params) = &stages[1] else {
@@ -1043,7 +1364,7 @@ pub(crate) async fn build_vector_index(
             let mut builder = IvfIndexBuilder::<FlatIndex, RabitQuantizer>::new(
                 dataset.clone(),
                 column.to_owned(),
-                dataset.indices_dir().child(uuid),
+                dataset.indices_dir().join(uuid.to_string()),
                 params.metric_type,
                 shuffler,
                 Some(ivf_params),
@@ -1052,11 +1373,13 @@ pub(crate) async fn build_vector_index(
                 frag_reuse_index,
             )?;
 
-            builder
+            let summary = builder
                 .with_transpose(!params.skip_transpose)
+                .with_optional_fragment_filter(fragment_ids)
                 .with_progress(progress.clone())
                 .build()
                 .await?;
+            Ok(summary.files)
         }
         IndexType::IvfHnswFlat => {
             let StageParams::Hnsw(hnsw_params) = &stages[1] else {
@@ -1067,10 +1390,10 @@ pub(crate) async fn build_vector_index(
             };
             match element_type {
                 DataType::UInt8 => {
-                    IvfIndexBuilder::<HNSW, FlatBinQuantizer>::new(
+                    let summary = IvfIndexBuilder::<HNSW, FlatBinQuantizer>::new(
                         dataset.clone(),
                         column.to_owned(),
-                        dataset.indices_dir().child(uuid),
+                        dataset.indices_dir().clone().join(uuid.to_string()),
                         params.metric_type,
                         shuffler,
                         Some(ivf_params),
@@ -1078,15 +1401,17 @@ pub(crate) async fn build_vector_index(
                         hnsw_params.clone(),
                         frag_reuse_index,
                     )?
+                    .with_optional_fragment_filter(fragment_ids)
                     .with_progress(progress.clone())
                     .build()
                     .await?;
+                    Ok(summary.files)
                 }
                 _ => {
-                    IvfIndexBuilder::<HNSW, FlatQuantizer>::new(
+                    let summary = IvfIndexBuilder::<HNSW, FlatQuantizer>::new(
                         dataset.clone(),
                         column.to_owned(),
-                        dataset.indices_dir().child(uuid),
+                        dataset.indices_dir().clone().join(uuid.to_string()),
                         params.metric_type,
                         shuffler,
                         Some(ivf_params),
@@ -1094,9 +1419,11 @@ pub(crate) async fn build_vector_index(
                         hnsw_params.clone(),
                         frag_reuse_index,
                     )?
+                    .with_optional_fragment_filter(fragment_ids)
                     .with_progress(progress.clone())
                     .build()
                     .await?;
+                    Ok(summary.files)
                 }
             }
         }
@@ -1113,10 +1440,10 @@ pub(crate) async fn build_vector_index(
                     stages
                 )));
             };
-            IvfIndexBuilder::<HNSW, ProductQuantizer>::new(
+            let summary = IvfIndexBuilder::<HNSW, ProductQuantizer>::new(
                 dataset.clone(),
                 column.to_owned(),
-                dataset.indices_dir().child(uuid),
+                dataset.indices_dir().clone().join(uuid.to_string()),
                 params.metric_type,
                 shuffler,
                 Some(ivf_params),
@@ -1124,9 +1451,11 @@ pub(crate) async fn build_vector_index(
                 hnsw_params.clone(),
                 frag_reuse_index,
             )?
+            .with_optional_fragment_filter(fragment_ids)
             .with_progress(progress.clone())
             .build()
             .await?;
+            Ok(summary.files)
         }
         IndexType::IvfHnswSq => {
             let StageParams::Hnsw(hnsw_params) = &stages[1] else {
@@ -1141,10 +1470,10 @@ pub(crate) async fn build_vector_index(
                     stages
                 )));
             };
-            IvfIndexBuilder::<HNSW, ScalarQuantizer>::new(
+            let summary = IvfIndexBuilder::<HNSW, ScalarQuantizer>::new(
                 dataset.clone(),
                 column.to_owned(),
-                dataset.indices_dir().child(uuid),
+                dataset.indices_dir().clone().join(uuid.to_string()),
                 params.metric_type,
                 shuffler,
                 Some(ivf_params),
@@ -1152,18 +1481,17 @@ pub(crate) async fn build_vector_index(
                 hnsw_params.clone(),
                 frag_reuse_index,
             )?
+            .with_optional_fragment_filter(fragment_ids)
             .with_progress(progress.clone())
             .build()
             .await?;
+            Ok(summary.files)
         }
-        _ => {
-            return Err(Error::index(format!(
-                "Build Vector Index: invalid index type: {:?}",
-                index_type
-            )));
-        }
-    };
-    Ok(())
+        _ => Err(Error::index(format!(
+            "Build Vector Index: invalid index type: {:?}",
+            index_type
+        ))),
+    }
 }
 
 /// Build a Vector Index incrementally using an existing index's IVF model and quantizer
@@ -1172,12 +1500,12 @@ pub(crate) async fn build_vector_index(
 pub(crate) async fn build_vector_index_incremental(
     dataset: &Dataset,
     column: &str,
-    uuid: &str,
+    uuid: Uuid,
     params: &VectorIndexParams,
     existing_index: Arc<dyn VectorIndex>,
-    frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
     progress: Arc<dyn IndexBuildProgress>,
-) -> Result<()> {
+) -> Result<VectorIndexBuildSummary> {
     let stages = &params.stages;
 
     if stages.is_empty() {
@@ -1229,7 +1557,7 @@ pub(crate) async fn build_vector_index_incremental(
         Some(progress.clone()),
     );
 
-    let index_dir = dataset.indices_dir().child(uuid);
+    let index_dir = dataset.indices_dir().join(uuid.to_string());
 
     // Determine the index type and build incrementally
     let (sub_index_type, quantization_type) = existing_index.sub_index_type();
@@ -1237,7 +1565,7 @@ pub(crate) async fn build_vector_index_incremental(
     match (sub_index_type, quantization_type) {
         // IVF_FLAT
         (SubIndexType::Flat, QuantizationType::Flat) => {
-            IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new_incremental(
+            let summary = IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new_incremental(
                 dataset.clone(),
                 column.to_owned(),
                 index_dir,
@@ -1252,9 +1580,10 @@ pub(crate) async fn build_vector_index_incremental(
             .with_progress(progress.clone())
             .build()
             .await?;
+            return Ok(summary);
         }
         (SubIndexType::Flat, QuantizationType::FlatBin) => {
-            IvfIndexBuilder::<FlatIndex, FlatBinQuantizer>::new_incremental(
+            let summary = IvfIndexBuilder::<FlatIndex, FlatBinQuantizer>::new_incremental(
                 dataset.clone(),
                 column.to_owned(),
                 index_dir,
@@ -1269,6 +1598,7 @@ pub(crate) async fn build_vector_index_incremental(
             .with_progress(progress.clone())
             .build()
             .await?;
+            return Ok(summary);
         }
         // IVF_PQ
         (SubIndexType::Flat, QuantizationType::Product) => {
@@ -1282,17 +1612,18 @@ pub(crate) async fn build_vector_index_incremental(
                 frag_reuse_index,
                 OptimizeOptions::append(),
             )?;
-            builder
+            let summary = builder
                 .with_ivf(ivf_model)
                 .with_quantizer(quantizer.try_into()?)
                 .with_transpose(!params.skip_transpose)
                 .with_progress(progress.clone())
                 .build()
                 .await?;
+            return Ok(summary);
         }
         // IVF_SQ
         (SubIndexType::Flat, QuantizationType::Scalar) => {
-            IvfIndexBuilder::<FlatIndex, ScalarQuantizer>::new_incremental(
+            let summary = IvfIndexBuilder::<FlatIndex, ScalarQuantizer>::new_incremental(
                 dataset.clone(),
                 column.to_owned(),
                 index_dir,
@@ -1307,6 +1638,7 @@ pub(crate) async fn build_vector_index_incremental(
             .with_progress(progress.clone())
             .build()
             .await?;
+            return Ok(summary);
         }
         // IVF_RQ
         (SubIndexType::Flat, QuantizationType::Rabit) => {
@@ -1320,13 +1652,14 @@ pub(crate) async fn build_vector_index_incremental(
                 frag_reuse_index,
                 OptimizeOptions::append(),
             )?;
-            builder
+            let summary = builder
                 .with_ivf(ivf_model)
                 .with_quantizer(quantizer.try_into()?)
                 .with_transpose(!params.skip_transpose)
                 .with_progress(progress.clone())
                 .build()
                 .await?;
+            return Ok(summary);
         }
         // IVF_HNSW variants
         (SubIndexType::Hnsw, quantization_type) => {
@@ -1339,7 +1672,7 @@ pub(crate) async fn build_vector_index_incremental(
 
             match quantization_type {
                 QuantizationType::Flat => {
-                    IvfIndexBuilder::<HNSW, FlatQuantizer>::new_incremental(
+                    let summary = IvfIndexBuilder::<HNSW, FlatQuantizer>::new_incremental(
                         dataset.clone(),
                         column.to_owned(),
                         index_dir,
@@ -1354,9 +1687,10 @@ pub(crate) async fn build_vector_index_incremental(
                     .with_progress(progress.clone())
                     .build()
                     .await?;
+                    return Ok(summary);
                 }
                 QuantizationType::FlatBin => {
-                    IvfIndexBuilder::<HNSW, FlatBinQuantizer>::new_incremental(
+                    let summary = IvfIndexBuilder::<HNSW, FlatBinQuantizer>::new_incremental(
                         dataset.clone(),
                         column.to_owned(),
                         index_dir,
@@ -1371,9 +1705,10 @@ pub(crate) async fn build_vector_index_incremental(
                     .with_progress(progress.clone())
                     .build()
                     .await?;
+                    return Ok(summary);
                 }
                 QuantizationType::Product => {
-                    IvfIndexBuilder::<HNSW, ProductQuantizer>::new_incremental(
+                    let summary = IvfIndexBuilder::<HNSW, ProductQuantizer>::new_incremental(
                         dataset.clone(),
                         column.to_owned(),
                         index_dir,
@@ -1388,9 +1723,10 @@ pub(crate) async fn build_vector_index_incremental(
                     .with_progress(progress.clone())
                     .build()
                     .await?;
+                    return Ok(summary);
                 }
                 QuantizationType::Scalar => {
-                    IvfIndexBuilder::<HNSW, ScalarQuantizer>::new_incremental(
+                    let summary = IvfIndexBuilder::<HNSW, ScalarQuantizer>::new_incremental(
                         dataset.clone(),
                         column.to_owned(),
                         index_dir,
@@ -1405,6 +1741,7 @@ pub(crate) async fn build_vector_index_incremental(
                     .with_progress(progress.clone())
                     .build()
                     .await?;
+                    return Ok(summary);
                 }
                 QuantizationType::Rabit => {
                     return Err(Error::index(
@@ -1414,49 +1751,42 @@ pub(crate) async fn build_vector_index_incremental(
             }
         }
     }
-
-    Ok(())
 }
 
-/// Build an empty vector index without training on data
+/// Create a vector index that carries its definition and no data.
+///
+/// The parameters live in the index's `index_details` and the fragment bitmap
+/// is empty, so it covers no rows and has no file to open. `optimize_indices`
+/// trains it once the column holds enough vectors.
 #[instrument(level = "debug", skip_all)]
 pub(crate) async fn build_empty_vector_index(
     _dataset: &Dataset,
-    column: &str,
-    name: &str,
-    _uuid: &str,
+    _column: &str,
+    _name: &str,
+    _uuid: Uuid,
     _params: &VectorIndexParams,
-) -> Result<()> {
-    // For now, return a NotImplementedError to indicate this functionality
-    // is still being developed
-    Err(Error::not_supported_source(
-        format!(
-            "Creating empty vector indices with train=False is not yet implemented. \
-        Index '{}' for column '{}' cannot be created without training.",
-            name, column
-        )
-        .into(),
-    ))
+) -> Result<Vec<IndexFile>> {
+    Ok(Vec::new())
 }
 
-#[instrument(level = "debug", skip_all, fields(old_uuid = old_uuid.to_string(), new_uuid = new_uuid.to_string(), num_rows = mapping.len()))]
+#[instrument(level = "debug", skip_all, fields(old_uuid = old_uuid.to_string(), new_uuid = new_uuid.to_string()))]
 pub(crate) async fn remap_vector_index(
     dataset: Arc<Dataset>,
     column: &str,
     old_uuid: &Uuid,
     new_uuid: &Uuid,
     old_metadata: &IndexMetadata,
-    mapping: &HashMap<u64, Option<u64>>,
-) -> Result<()> {
+    mapping: &RowAddrTranslator,
+) -> Result<Vec<IndexFile>> {
     let old_index = dataset
-        .open_vector_index(column, &old_uuid.to_string(), &NoOpMetricsCollector)
+        .open_vector_index(column, old_uuid, &NoOpMetricsCollector)
         .await?;
 
     if let Some(ivf_index) = old_index.as_any().downcast_ref::<IVFIndex>() {
-        remap_index_file(
+        let file = remap_index_file(
             dataset.as_ref(),
-            &old_uuid.to_string(),
-            &new_uuid.to_string(),
+            old_uuid,
+            new_uuid,
             old_metadata.dataset_version,
             ivf_index,
             mapping,
@@ -1468,29 +1798,29 @@ pub(crate) async fn remap_vector_index(
             vec![],
         )
         .await?;
+        Ok(vec![file])
     } else {
         // it's v3 index
-        remap_index_file_v3(
+        let files = remap_index_file_v3(
             dataset.as_ref(),
-            &new_uuid.to_string(),
+            new_uuid,
             old_index,
             mapping,
             column.to_string(),
         )
         .await?;
+        Ok(files)
     }
-
-    Ok(())
 }
 
 /// Open the Vector index on dataset, specified by the `uuid`.
 #[instrument(level = "debug", skip(dataset, vec_idx, reader))]
 pub(crate) async fn open_vector_index(
     dataset: Arc<Dataset>,
-    uuid: &str,
+    uuid: &Uuid,
     vec_idx: &lance_index::pb::VectorIndex,
     reader: Arc<dyn Reader>,
-    frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
 ) -> Result<Arc<dyn VectorIndex>> {
     let metric_type = pb::VectorMetricType::try_from(vec_idx.metric_type)?.into();
 
@@ -1518,7 +1848,7 @@ pub(crate) async fn open_vector_index(
                 }
                 let ivf = IvfModel::try_from(ivf_pb.to_owned())?;
                 last_stage = Some(Arc::new(IVFIndex::try_new(
-                    uuid,
+                    *uuid,
                     ivf,
                     reader.clone(),
                     last_stage.unwrap(),
@@ -1561,13 +1891,31 @@ pub(crate) async fn open_vector_index(
     Ok(idx)
 }
 
+/// Open an index file without a HEAD request when the size is already known.
+///
+/// `file_sizes` maps a file name to its size in bytes (see
+/// `IndexMetadata::file_size_map`). If `file_name` is missing, which is the case
+/// for older indices that did not record sizes, this falls back to `open`, which
+/// issues a HEAD to learn the size.
+pub(crate) async fn open_index_file(
+    object_store: &ObjectStore,
+    path: &Path,
+    file_name: &str,
+    file_sizes: &HashMap<String, u64>,
+) -> Result<Box<dyn Reader>> {
+    match file_sizes.get(file_name) {
+        Some(&size) => object_store.open_with_size(path, size as usize).await,
+        None => object_store.open(path).await,
+    }
+}
+
 #[instrument(level = "debug", skip(dataset, reader))]
 pub(crate) async fn open_vector_index_v2(
     dataset: Arc<Dataset>,
     column: &str,
-    uuid: &str,
-    reader: PreviousFileReader,
-    frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    uuid: &Uuid,
+    reader: V1FileReader,
+    frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
 ) -> Result<Arc<dyn VectorIndex>> {
     let index_metadata = reader
         .schema()
@@ -1584,11 +1932,22 @@ pub(crate) async fn open_vector_index_v2(
         .await?
         .ok_or_else(|| Error::index(format!("Index with id {} does not exist", uuid)))?;
     let index_dir = dataset.indice_files_dir(&index_meta)?;
+    let object_store = dataset.object_store_for_index(&index_meta).await?;
+    let file_sizes = index_meta.file_size_map();
 
     let index: Arc<dyn VectorIndex> = match index_metadata.index_type.as_str() {
         "IVF_HNSW_PQ" => {
-            let aux_path = index_dir.child(uuid).child(INDEX_AUXILIARY_FILE_NAME);
-            let aux_reader = dataset.object_store().open(&aux_path).await?;
+            let aux_path = index_dir
+                .clone()
+                .join(uuid.to_string())
+                .join(INDEX_AUXILIARY_FILE_NAME);
+            let aux_reader = open_index_file(
+                object_store.as_ref(),
+                &aux_path,
+                INDEX_AUXILIARY_FILE_NAME,
+                &file_sizes,
+            )
+            .await?;
 
             let ivf_data = IvfModel::load(&reader).await?;
             let options = HNSWIndexOptions { use_residual: true };
@@ -1602,7 +1961,7 @@ pub(crate) async fn open_vector_index_v2(
             let ivf = IvfModel::try_from(pb_ivf)?;
 
             Arc::new(IVFIndex::try_new(
-                uuid,
+                *uuid,
                 ivf,
                 reader.object_reader.clone(),
                 Arc::new(hnsw),
@@ -1614,8 +1973,17 @@ pub(crate) async fn open_vector_index_v2(
         }
 
         "IVF_HNSW_SQ" => {
-            let aux_path = index_dir.child(uuid).child(INDEX_AUXILIARY_FILE_NAME);
-            let aux_reader = dataset.object_store().open(&aux_path).await?;
+            let aux_path = index_dir
+                .clone()
+                .join(uuid.to_string())
+                .join(INDEX_AUXILIARY_FILE_NAME);
+            let aux_reader = open_index_file(
+                object_store.as_ref(),
+                &aux_path,
+                INDEX_AUXILIARY_FILE_NAME,
+                &file_sizes,
+            )
+            .await?;
 
             let ivf_data = IvfModel::load(&reader).await?;
             let options = HNSWIndexOptions {
@@ -1632,7 +2000,7 @@ pub(crate) async fn open_vector_index_v2(
             let ivf = IvfModel::try_from(pb_ivf)?;
 
             Arc::new(IVFIndex::try_new(
-                uuid,
+                *uuid,
                 ivf,
                 reader.object_reader.clone(),
                 Arc::new(hnsw),
@@ -1689,11 +2057,7 @@ pub async fn initialize_vector_index(
     let column_name = field_names[0];
 
     let source_vector_index = source_dataset
-        .open_vector_index(
-            column_name,
-            &source_index.uuid.to_string(),
-            &NoOpMetricsCollector,
-        )
+        .open_vector_index(column_name, &source_index.uuid, &NoOpMetricsCollector)
         .await?;
 
     let metric_type = source_vector_index.metric_type();
@@ -1762,20 +2126,16 @@ pub async fn initialize_vector_index(
         .open_frag_reuse_index(&NoOpMetricsCollector)
         .await?;
 
-    build_vector_index_incremental(
+    let summary = build_vector_index_incremental(
         target_dataset,
         column_name,
-        &new_uuid.to_string(),
+        new_uuid,
         &params,
         source_vector_index,
         frag_reuse_index,
         noop_progress(),
     )
     .await?;
-
-    // Capture file sizes for the new vector index
-    let index_dir = target_dataset.indices_dir().child(new_uuid.to_string());
-    let files = list_index_files_with_sizes(&target_dataset.object_store, &index_dir).await?;
 
     let field = target_dataset.schema().field(column_name).ok_or_else(|| {
         Error::index(format!(
@@ -1790,13 +2150,14 @@ pub async fn initialize_vector_index(
         uuid: new_uuid,
         name: source_index.name.clone(),
         fields: vec![field.id],
+        covering_fields: vec![],
         dataset_version: target_dataset.manifest.version,
         fragment_bitmap,
-        index_details: Some(Arc::new(vector_index_details())),
+        index_details: source_index.index_details.clone(),
         index_version: source_index.index_version,
         created_at: Some(chrono::Utc::now()),
         base_id: None,
-        files: Some(files),
+        files: Some(summary.files),
     };
 
     let transaction = Transaction::new(
@@ -1826,6 +2187,9 @@ fn derive_ivf_params(ivf_model: &IvfModel) -> IvfBuildParams {
         #[allow(deprecated)]
         retrain: false, // Don't retrain since we have centroids
         sample_rate: 256, // Default
+        streaming_sample_rate: None,
+        streaming_coreset_rate: None,
+        streaming_refine_passes: 0,
         precomputed_partitions_file: None,
         precomputed_shuffle_buffers: None,
         precomputed_partition_artifact_uri: None,
@@ -1863,13 +2227,14 @@ fn derive_rabit_params(rabit_quantizer: &RabitQuantizer) -> RQBuildParams {
     RQBuildParams {
         num_bits: rabit_quantizer.num_bits(),
         rotation_type: rabit_quantizer.rotation_type(),
+        rotation: None,
     }
 }
 
 /// Extract HNSW build parameters from the source vector index statistics.
 /// Returns default parameters if extraction fails.
 /// TODO: support consistently deriving all the original parameters
-fn derive_hnsw_params(source_index: &dyn VectorIndex) -> HnswBuildParams {
+pub(crate) fn derive_hnsw_params(source_index: &dyn VectorIndex) -> HnswBuildParams {
     let default_params = HnswBuildParams {
         max_level: 4,
         m: 20,
@@ -1902,16 +2267,122 @@ fn derive_hnsw_params(source_index: &dyn VectorIndex) -> HnswBuildParams {
             .and_then(|v| v.as_u64())
             .map(|v| v as usize)
             .unwrap_or(100);
+        let prefetch_distance = params
+            .get("prefetch_distance")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
 
         return HnswBuildParams {
             max_level,
             m,
             ef_construction,
-            prefetch_distance: None,
+            prefetch_distance,
         };
     }
 
     default_params
+}
+
+fn vector_index_type(index: &dyn VectorIndex) -> IndexType {
+    match index.sub_index_type() {
+        (SubIndexType::Flat, QuantizationType::Flat | QuantizationType::FlatBin) => {
+            IndexType::IvfFlat
+        }
+        (SubIndexType::Flat, QuantizationType::Product) => IndexType::IvfPq,
+        (SubIndexType::Flat, QuantizationType::Scalar) => IndexType::IvfSq,
+        (SubIndexType::Flat, QuantizationType::Rabit) => IndexType::IvfRq,
+        (SubIndexType::Hnsw, QuantizationType::Flat | QuantizationType::FlatBin) => {
+            IndexType::IvfHnswFlat
+        }
+        (SubIndexType::Hnsw, QuantizationType::Product) => IndexType::IvfHnswPq,
+        (SubIndexType::Hnsw, QuantizationType::Scalar) => IndexType::IvfHnswSq,
+        (SubIndexType::Hnsw, QuantizationType::Rabit) => IndexType::Vector,
+    }
+}
+
+/// Derive structural build parameters for a new, independently trained segment.
+///
+/// Learned IVF centroids, quantizer codebooks, and rotations are deliberately
+/// omitted so the new segment is valid for its own fragment set.
+pub(crate) fn fresh_vector_segment_params(
+    metadata: &IndexMetadata,
+    index: &dyn VectorIndex,
+) -> Result<VectorIndexParams> {
+    if let Some(params) = metadata
+        .index_details
+        .as_deref()
+        .and_then(details::vector_params_from_details)
+        && params.metric_type == index.metric_type()
+        && params.index_type() == vector_index_type(index)
+    {
+        return Ok(params);
+    }
+
+    let mut ivf_params = derive_ivf_params(index.ivf_model());
+    ivf_params.centroids = None;
+    #[allow(deprecated)]
+    {
+        ivf_params.retrain = false;
+    }
+
+    let metric_type = index.metric_type();
+    let quantizer = index.quantizer();
+    Ok(match index.sub_index_type() {
+        (SubIndexType::Flat, QuantizationType::Flat | QuantizationType::FlatBin) => {
+            VectorIndexParams::with_ivf_flat_params(metric_type, ivf_params)
+        }
+        (SubIndexType::Flat, QuantizationType::Product) => {
+            let quantizer: ProductQuantizer = quantizer.try_into()?;
+            let mut pq_params = derive_pq_params(&quantizer);
+            pq_params.codebook = None;
+            VectorIndexParams::with_ivf_pq_params(metric_type, ivf_params, pq_params)
+        }
+        (SubIndexType::Flat, QuantizationType::Scalar) => {
+            let quantizer: ScalarQuantizer = quantizer.try_into()?;
+            VectorIndexParams::with_ivf_sq_params(
+                metric_type,
+                ivf_params,
+                derive_sq_params(&quantizer),
+            )
+        }
+        (SubIndexType::Flat, QuantizationType::Rabit) => {
+            let quantizer: RabitQuantizer = quantizer.try_into()?;
+            VectorIndexParams::with_ivf_rq_params(
+                metric_type,
+                ivf_params,
+                derive_rabit_params(&quantizer),
+            )
+        }
+        (SubIndexType::Hnsw, QuantizationType::Flat | QuantizationType::FlatBin) => {
+            VectorIndexParams::ivf_hnsw(metric_type, ivf_params, derive_hnsw_params(index))
+        }
+        (SubIndexType::Hnsw, QuantizationType::Product) => {
+            let quantizer: ProductQuantizer = quantizer.try_into()?;
+            let mut pq_params = derive_pq_params(&quantizer);
+            pq_params.codebook = None;
+            VectorIndexParams::with_ivf_hnsw_pq_params(
+                metric_type,
+                ivf_params,
+                derive_hnsw_params(index),
+                pq_params,
+            )
+        }
+        (SubIndexType::Hnsw, QuantizationType::Scalar) => {
+            let quantizer: ScalarQuantizer = quantizer.try_into()?;
+            VectorIndexParams::with_ivf_hnsw_sq_params(
+                metric_type,
+                ivf_params,
+                derive_hnsw_params(index),
+                derive_sq_params(&quantizer),
+            )
+        }
+        (SubIndexType::Hnsw, QuantizationType::Rabit) => {
+            return Err(Error::index(
+                "Cannot build a fresh IVF_HNSW_RQ segment: this index type is unsupported"
+                    .to_string(),
+            ));
+        }
+    })
 }
 
 #[cfg(test)]
@@ -1927,7 +2398,260 @@ mod tests {
     use lance_datagen::{BatchCount, RowCount, array};
     use lance_file::writer::FileWriterOptions;
     use lance_index::metrics::NoOpMetricsCollector;
+    use lance_index::vector::ivf::builder::IvfBuildParams;
     use lance_linalg::distance::MetricType;
+
+    /// IVF_RQ encodes residuals under L2 or dot; the RQ transform rejects other
+    /// metrics, but only once the IVF model has been trained, so the build spends
+    /// the training pass before failing. Hamming is also contradictory for RQ,
+    /// which requires float vectors while Hamming is a binary-vector metric.
+    #[tokio::test]
+    async fn test_build_rejects_hamming_for_rq() {
+        use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+        use lance_index::vector::bq::RQBuildParams;
+
+        let dim = 16;
+        let mut dataset = lance_datagen::gen_batch()
+            .col(
+                "vector",
+                array::rand_vec::<Float32Type>(lance_datagen::Dimension::from(dim)),
+            )
+            .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(256))
+            .await
+            .unwrap();
+
+        let params = VectorIndexParams::with_ivf_rq_params(
+            MetricType::Hamming,
+            IvfBuildParams::new(2),
+            RQBuildParams::default(),
+        );
+        let err = dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("IVF_RQ does not support the hamming metric"),
+            "expected the up-front metric rejection, got: {err}"
+        );
+    }
+
+    /// A build that was handed its codebook has nothing to fit, so the rows
+    /// that fitting would have needed are not required of it.
+    ///
+    /// Without this a caller who supplies both the centroids and the codebook
+    /// -- a fully specified index, needing no training data at all -- has the
+    /// build deferred and gets an empty index back.
+    #[test]
+    fn a_supplied_codebook_needs_no_rows_to_train_on() {
+        use arrow_array::{FixedSizeListArray, Float32Array};
+        use lance_index::vector::pq::PQBuildParams;
+
+        let eight_bit = PQBuildParams {
+            num_bits: 8,
+            ..Default::default()
+        };
+        assert_eq!(
+            vector_quantizer_minimum_rows(&[StageParams::PQ(eight_bit.clone())]),
+            Some(256),
+            "fitting an 8-bit codebook needs a row per code"
+        );
+
+        let values = Float32Array::from(vec![0.0_f32; 2 * 256 * 4]);
+        let codebook = FixedSizeListArray::try_new_from_values(values, 2).unwrap();
+        let supplied = PQBuildParams {
+            codebook: Some(Arc::new(codebook)),
+            ..eight_bit
+        };
+        assert_eq!(
+            vector_quantizer_minimum_rows(&[StageParams::PQ(supplied)]),
+            None,
+            "a supplied codebook is the fit, so no rows are needed for it"
+        );
+    }
+
+    /// A null vector inside a multivector row is not one to train on.
+    ///
+    /// The row's list length counts it, so counting lengths reports more
+    /// trainable vectors than exist -- and this count decides whether there is
+    /// enough data to train at all, so erring high is the direction that
+    /// trains an index it should have deferred.
+    #[tokio::test]
+    async fn a_null_vector_inside_a_multivector_row_is_not_trainable() {
+        use arrow_array::RecordBatchIterator;
+        use arrow_array::builder::{FixedSizeListBuilder, Float32Builder, ListBuilder};
+
+        const DIM: i32 = 2;
+        let item = Arc::new(Field::new("item", ArrowDataType::Float32, true));
+        let vector = Arc::new(Field::new(
+            "item",
+            ArrowDataType::FixedSizeList(item, DIM),
+            true,
+        ));
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "vec",
+            ArrowDataType::List(vector),
+            true,
+        )]));
+
+        // Three rows: two vectors, then one vector and one null, then a null
+        // list. Four elements are present; three of them are trainable.
+        let mut builder = ListBuilder::new(FixedSizeListBuilder::new(Float32Builder::new(), DIM));
+        for row in [
+            vec![Some([1.0, 2.0]), Some([3.0, 4.0])],
+            vec![Some([5.0, 6.0]), None],
+        ] {
+            for cell in row {
+                match cell {
+                    Some(v) => {
+                        builder.values().values().append_slice(&v);
+                        builder.values().append(true);
+                    }
+                    None => {
+                        builder.values().values().append_slice(&[0.0; DIM as usize]);
+                        builder.values().append(false);
+                    }
+                }
+            }
+            builder.append(true);
+        }
+        builder.append(false);
+        let array = builder.finish();
+
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(array)]).unwrap();
+        let dir = TempStrDir::default();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let dataset = Dataset::write(reader, dir.as_str(), None).await.unwrap();
+
+        let counted = count_trainable_vectors(&dataset, "vec", 3, usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            counted, 3,
+            "the null vector in the second row must not be counted"
+        );
+    }
+
+    /// `open_index_file` skips the HEAD when the size is known and still falls
+    /// back to a HEAD for older indices that did not record sizes. A HEAD is
+    /// issued as a `get_opts` call with `head = true`, so a proxy store counts
+    /// those against the index file.
+    ///
+    /// Regression test for <https://github.com/lance-format/lance/issues/6944>.
+    #[tokio::test]
+    async fn test_open_index_file_skips_head_when_size_known() {
+        use lance_index::INDEX_FILE_NAME;
+        use lance_io::assert_io_eq;
+        use lance_io::object_store::{ObjectStoreParams, ObjectStoreRegistry};
+
+        let (store, base) = ObjectStore::from_uri_and_params(
+            Arc::new(ObjectStoreRegistry::default()),
+            "memory:///",
+            &ObjectStoreParams::default(),
+        )
+        .await
+        .unwrap();
+
+        let path = base.join(INDEX_FILE_NAME);
+        // Larger than the block size so size discovery needs a separate HEAD.
+        let data = vec![7u8; 2 * store.block_size()];
+        store.put(&path, &data).await.unwrap();
+
+        let file_sizes = HashMap::from([(INDEX_FILE_NAME.to_string(), data.len() as u64)]);
+
+        // Size recorded in the manifest, so reading the size issues no HEAD.
+        let _ = store.io_stats_incremental(); // reset
+        let reader = open_index_file(store.as_ref(), &path, INDEX_FILE_NAME, &file_sizes)
+            .await
+            .unwrap();
+        assert_eq!(reader.size().await.unwrap(), data.len());
+        let stats = store.io_stats_incremental();
+        assert_io_eq!(
+            stats,
+            read_iops,
+            0,
+            "a known file size must not trigger a HEAD request"
+        );
+
+        // Size unknown, as in an older index, so it falls back to a HEAD.
+        let _ = store.io_stats_incremental(); // reset
+        let reader = open_index_file(store.as_ref(), &path, INDEX_FILE_NAME, &HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(reader.size().await.unwrap(), data.len());
+        let stats = store.io_stats_incremental();
+        assert_io_eq!(
+            stats,
+            read_iops,
+            1,
+            "an unknown file size must fall back to exactly one HEAD request"
+        );
+    }
+
+    /// `open_index_file` looks up sizes in `IndexMetadata::file_size_map()` by
+    /// bare file name. This pins that a freshly created HNSW index records both
+    /// the main and auxiliary files under those exact names with nonzero sizes,
+    /// which is what lets the open path skip the HEAD.
+    #[tokio::test]
+    async fn test_hnsw_index_records_file_sizes() {
+        use lance_index::{INDEX_AUXILIARY_FILE_NAME, INDEX_FILE_NAME};
+
+        let test_dir = TempStrDir::default();
+        let uri = format!("{}/ds", test_dir.as_str());
+
+        let reader = lance_datagen::gen_batch()
+            .col("vector", array::rand_vec::<Float32Type>(8.into()))
+            .into_reader_rows(RowCount::from(64), BatchCount::from(1));
+        let mut dataset = Dataset::write(reader, &uri, None).await.unwrap();
+
+        let params = VectorIndexParams::with_ivf_hnsw_pq_params(
+            MetricType::L2,
+            IvfBuildParams {
+                num_partitions: Some(2),
+                max_iters: 2,
+                sample_rate: 2,
+                ..Default::default()
+            },
+            HnswBuildParams::default()
+                .max_level(2)
+                .num_edges(4)
+                .ef_construction(16),
+            PQBuildParams {
+                num_sub_vectors: 2,
+                num_bits: 4,
+                max_iters: 2,
+                sample_rate: 2,
+                ..Default::default()
+            },
+        );
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("hnsw".to_string()),
+                &params,
+                false,
+            )
+            .await
+            .unwrap();
+
+        let indices = dataset.load_indices().await.unwrap();
+        let index = indices.iter().find(|idx| idx.name == "hnsw").unwrap();
+        let file_sizes = index.file_size_map();
+
+        assert!(
+            file_sizes.get(INDEX_FILE_NAME).copied().unwrap_or(0) > 0,
+            "manifest should record a nonzero {INDEX_FILE_NAME} size, got {file_sizes:?}"
+        );
+        assert!(
+            file_sizes
+                .get(INDEX_AUXILIARY_FILE_NAME)
+                .copied()
+                .unwrap_or(0)
+                > 0,
+            "manifest should record a nonzero {INDEX_AUXILIARY_FILE_NAME} size, got {file_sizes:?}"
+        );
+    }
 
     #[tokio::test]
     async fn test_initialize_vector_index_ivf_pq() {
@@ -1935,11 +2659,11 @@ mod tests {
         let source_uri = format!("{}/source", test_dir.as_str());
         let target_uri = format!("{}/target", test_dir.as_str());
 
-        // Create source dataset with vector column (need at least 256 rows for PQ training)
+        // Ten partitions, each needing a codebook's worth of vectors.
         let source_reader = lance_datagen::gen_batch()
             .col("id", array::step::<Int32Type>())
             .col("vector", array::rand_vec::<Float32Type>(32.into()))
-            .into_reader_rows(RowCount::from(300), BatchCount::from(1));
+            .into_reader_rows(RowCount::from(2560), BatchCount::from(1));
         let mut source_dataset = Dataset::write(source_reader, &source_uri, None)
             .await
             .unwrap();
@@ -1999,11 +2723,7 @@ mod tests {
 
         // Verify the index type and parameters match
         let target_vector_index = target_dataset
-            .open_vector_index(
-                "vector",
-                &target_indices[0].uuid.to_string(),
-                &NoOpMetricsCollector,
-            )
+            .open_vector_index("vector", &target_indices[0].uuid, &NoOpMetricsCollector)
             .await
             .unwrap();
         let stats = target_vector_index.statistics().unwrap();
@@ -2031,11 +2751,7 @@ mod tests {
 
         // Verify centroids are shared between source and target indices
         let source_vector_index = source_dataset
-            .open_vector_index(
-                "vector",
-                &source_index.uuid.to_string(),
-                &NoOpMetricsCollector,
-            )
+            .open_vector_index("vector", &source_index.uuid, &NoOpMetricsCollector)
             .await
             .unwrap();
 
@@ -2144,6 +2860,102 @@ mod tests {
         assert_eq!(results.num_rows(), 10, "Should return 10 nearest neighbors");
     }
 
+    /// The scratch directory the guard owns has to be gone once the build is
+    /// over, or the OS temp dir grows by one shuffled copy of the vector column
+    /// per index build.
+    ///
+    /// The OS temp dir is process-global, so an in-process check cannot
+    /// attribute a leftover directory to our own build. This test re-executes
+    /// itself in a child process with `TMPDIR` pointed at an isolated dir we
+    /// own: the child builds, the parent asserts nothing survives. Same shape as
+    /// `index::vector::ivf::io::tests::test_hnsw_pq_scratch_dir_is_not_leaked`,
+    /// which covers the legacy partition-staging dir.
+    #[test]
+    fn test_shuffle_scratch_dir_is_not_leaked() {
+        const ROOT_VAR: &str = "LANCE_SHUFFLE_LEAK_TEST_ROOT";
+
+        // Child half: build under the root the parent handed us and let it do the
+        // leak detection. The dataset goes outside the temp dir's `.tmp*` namespace
+        // so the parent never mistakes it for a leaked scratch directory. Read the
+        // value as an `OsString`: with `env::var`, a root that is not valid UTF-8
+        // would send the child down the parent branch and have it spawn a child of
+        // its own, without end.
+        if let Some(root) = std::env::var_os(ROOT_VAR) {
+            let root = root
+                .into_string()
+                .expect("the isolated root must be valid UTF-8");
+            tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(async move {
+                    let uri = format!("{root}/dataset");
+                    let reader = lance_datagen::gen_batch()
+                        .col("id", array::step::<Int32Type>())
+                        .col("vector", array::rand_vec::<Float32Type>(8.into()))
+                        .into_reader_rows(RowCount::from(256), BatchCount::from(1));
+                    let mut dataset = Dataset::write(reader, &uri, None).await.unwrap();
+
+                    let params = VectorIndexParams::ivf_flat(2, MetricType::L2);
+                    for i in 0..2 {
+                        dataset
+                            .create_index(
+                                &["vector"],
+                                IndexType::Vector,
+                                Some(format!("vector_idx_{i}")),
+                                &params,
+                                false,
+                            )
+                            .await
+                            .unwrap();
+                    }
+                });
+            return;
+        }
+
+        let isolated_root = TempStdDir::default();
+        // libtest names the thread after the running test, so the child's filter
+        // cannot drift out of sync with this function's name.
+        let this_test = std::thread::current().name().unwrap().to_string();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([&this_test, "--exact", "--nocapture"])
+            .env("TMPDIR", isolated_root.as_ref())
+            .env(ROOT_VAR, isolated_root.as_ref())
+            .output()
+            .expect("failed to spawn child test process");
+        assert!(
+            output.status.success(),
+            "child build process failed:\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+
+        // A filter that matches nothing also exits 0, so confirm the child did the
+        // work instead of reporting a clean scan of an untouched directory.
+        assert!(
+            isolated_root.join("dataset").is_dir(),
+            "the child process did not run the build; filter was {this_test:?}"
+        );
+
+        // Every scratch dir a build creates sits directly under TMPDIR and is
+        // owned by a guard, so none should survive the child process.
+        let leaked: Vec<std::path::PathBuf> = std::fs::read_dir(&isolated_root)
+            .expect("read isolated temp root")
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.is_dir()
+                    && path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with(".tmp"))
+            })
+            .collect();
+
+        assert!(
+            leaked.is_empty(),
+            "vector index build leaked scratch directories under the temp dir: {leaked:?}"
+        );
+    }
+
     #[tokio::test]
     async fn test_initialize_vector_index_ivf_flat() {
         let test_dir = TempStrDir::default();
@@ -2214,11 +3026,7 @@ mod tests {
 
         // Verify the index type and parameters match
         let target_vector_index = target_dataset
-            .open_vector_index(
-                "vector",
-                &target_indices[0].uuid.to_string(),
-                &NoOpMetricsCollector,
-            )
+            .open_vector_index("vector", &target_indices[0].uuid, &NoOpMetricsCollector)
             .await
             .unwrap();
         let stats = target_vector_index.statistics().unwrap();
@@ -2250,11 +3058,7 @@ mod tests {
 
         // Verify centroids are shared between source and target indices
         let source_vector_index = source_dataset
-            .open_vector_index(
-                "vector",
-                &source_index.uuid.to_string(),
-                &NoOpMetricsCollector,
-            )
+            .open_vector_index("vector", &source_index.uuid, &NoOpMetricsCollector)
             .await
             .unwrap();
 
@@ -2360,7 +3164,7 @@ mod tests {
         let invalid_id = max_id + 1000;
 
         // let params = VectorIndexParams::ivf_flat(4, MetricType::L2);
-        let uuid = Uuid::new_v4().to_string();
+        let uuid = Uuid::new_v4();
 
         let mut ivf_params = IvfBuildParams {
             num_partitions: Some(4),
@@ -2388,7 +3192,7 @@ mod tests {
             &dataset,
             "vector",
             "vector_ivf_flat_dist",
-            &uuid,
+            uuid,
             &params,
             None,
             &[invalid_id],
@@ -2414,7 +3218,7 @@ mod tests {
             .into_reader_rows(RowCount::from(128), BatchCount::from(1));
         let dataset = Dataset::write(reader, &uri, None).await.unwrap();
 
-        let uuid = Uuid::new_v4().to_string();
+        let uuid = Uuid::new_v4();
         let mut ivf_params = IvfBuildParams {
             num_partitions: Some(4),
             ..Default::default()
@@ -2441,7 +3245,7 @@ mod tests {
             &dataset,
             "vector",
             "vector_ivf_flat_dist",
-            &uuid,
+            uuid,
             &params,
             None,
             &[],
@@ -2503,7 +3307,7 @@ mod tests {
         let dataset = Dataset::write(reader, &uri, None).await.unwrap();
 
         let params = VectorIndexParams::ivf_flat(4, MetricType::L2);
-        let uuid = Uuid::new_v4().to_string();
+        let uuid = Uuid::new_v4();
         let progress = Arc::new(RecordingProgress {
             train_ivf_complete: AtomicBool::new(false),
             saw_train_ivf_progress_before_complete: AtomicBool::new(false),
@@ -2514,7 +3318,7 @@ mod tests {
             &dataset,
             "vector",
             "vector_ivf_flat_progress",
-            &uuid,
+            uuid,
             &params,
             None,
             progress.clone(),
@@ -2548,16 +3352,22 @@ mod tests {
         let dataset = Dataset::write(reader, &uri, None).await.unwrap();
 
         let params = VectorIndexParams::ivf_flat(4, MetricType::L2);
-        let uuid = Uuid::new_v4().to_string();
+        let uuid = Uuid::new_v4();
 
         // Pre-create a malformed global training file that is missing the
         // `lance:global_ivf_centroids` metadata key.
-        let out_base = dataset.indices_dir().child(&*uuid);
-        let training_path = out_base.child("global_training.idx");
+        let out_base = dataset.indices_dir().join(uuid.to_string());
+        let training_path = out_base.clone().join("global_training.idx");
 
-        let writer = dataset.object_store().create(&training_path).await.unwrap();
+        let writer = dataset
+            .object_store
+            .as_ref()
+            .create(&training_path)
+            .await
+            .unwrap();
         let arrow_schema = ArrowSchema::new(vec![Field::new("dummy", ArrowDataType::Int32, true)]);
-        let mut v2w = lance_file::writer::FileWriter::try_new(
+        let mut v2w = lance_file::versions::create_writer(
+            dataset_format_version(&dataset),
             writer,
             lance_core::datatypes::Schema::try_from(&arrow_schema).unwrap(),
             FileWriterOptions::default(),
@@ -2578,7 +3388,7 @@ mod tests {
             &dataset,
             "vector",
             "vector_ivf_flat_dist",
-            &uuid,
+            uuid,
             &params,
             None,
             &[valid_id],
@@ -2667,20 +3477,12 @@ mod tests {
 
         // Open both indices to compare centroids
         let source_vector_index = source_dataset
-            .open_vector_index(
-                "vector",
-                &source_index.uuid.to_string(),
-                &NoOpMetricsCollector,
-            )
+            .open_vector_index("vector", &source_index.uuid, &NoOpMetricsCollector)
             .await
             .unwrap();
 
         let target_vector_index = target_dataset
-            .open_vector_index(
-                "vector",
-                &target_indices[0].uuid.to_string(),
-                &NoOpMetricsCollector,
-            )
+            .open_vector_index("vector", &target_indices[0].uuid, &NoOpMetricsCollector)
             .await
             .unwrap();
 
@@ -2794,11 +3596,7 @@ mod tests {
         // Verify that the optimized index still shares centroids with the source
         let target_indices = target_dataset.load_indices().await.unwrap();
         let target_vector_index = target_dataset
-            .open_vector_index(
-                "vector",
-                &target_indices[0].uuid.to_string(),
-                &NoOpMetricsCollector,
-            )
+            .open_vector_index("vector", &target_indices[0].uuid, &NoOpMetricsCollector)
             .await
             .unwrap();
 
@@ -2904,11 +3702,7 @@ mod tests {
 
         // Verify the index type and parameters match
         let target_vector_index = target_dataset
-            .open_vector_index(
-                "vector",
-                &target_indices[0].uuid.to_string(),
-                &NoOpMetricsCollector,
-            )
+            .open_vector_index("vector", &target_indices[0].uuid, &NoOpMetricsCollector)
             .await
             .unwrap();
         let stats = target_vector_index.statistics().unwrap();
@@ -2940,11 +3734,7 @@ mod tests {
 
         // Verify centroids are shared between source and target indices
         let source_vector_index = source_dataset
-            .open_vector_index(
-                "vector",
-                &source_index.uuid.to_string(),
-                &NoOpMetricsCollector,
-            )
+            .open_vector_index("vector", &source_index.uuid, &NoOpMetricsCollector)
             .await
             .unwrap();
 
@@ -3050,29 +3840,33 @@ mod tests {
         let source_uri = format!("{}/source", test_dir.as_str());
         let target_uri = format!("{}/target", test_dir.as_str());
 
-        // Create source dataset with vector column (need at least 256 rows for PQ training)
+        // A 4-bit PQ codebook needs at least 16 training rows.
         let source_reader = lance_datagen::gen_batch()
             .col("id", array::step::<Int32Type>())
-            .col("vector", array::rand_vec::<Float32Type>(32.into()))
-            .into_reader_rows(RowCount::from(400), BatchCount::from(1));
+            .col("vector", array::rand_vec::<Float32Type>(8.into()))
+            .into_reader_rows(RowCount::from(64), BatchCount::from(1));
         let mut source_dataset = Dataset::write(source_reader, &source_uri, None)
             .await
             .unwrap();
 
         // Create IVF_HNSW_PQ index on source with custom HNSW parameters
         let ivf_params = IvfBuildParams {
-            num_partitions: Some(8),
+            num_partitions: Some(2),
+            max_iters: 2,
+            sample_rate: 2,
             ..Default::default()
         };
         let hnsw_params = HnswBuildParams {
-            max_level: 6,
-            m: 24,
-            ef_construction: 120,
+            max_level: 2,
+            m: 4,
+            ef_construction: 16,
             prefetch_distance: None,
         };
         let pq_params = PQBuildParams {
-            num_sub_vectors: 8,
-            num_bits: 8,
+            num_sub_vectors: 2,
+            num_bits: 4,
+            max_iters: 2,
+            sample_rate: 2,
             ..Default::default()
         };
         let params = VectorIndexParams::with_ivf_hnsw_pq_params(
@@ -3104,8 +3898,8 @@ mod tests {
         // Create target dataset with same schema
         let target_reader = lance_datagen::gen_batch()
             .col("id", array::step::<Int32Type>())
-            .col("vector", array::rand_vec::<Float32Type>(32.into()))
-            .into_reader_rows(RowCount::from(100), BatchCount::from(1));
+            .col("vector", array::rand_vec::<Float32Type>(8.into()))
+            .into_reader_rows(RowCount::from(32), BatchCount::from(1));
         let mut target_dataset = Dataset::write(target_reader, &target_uri, None)
             .await
             .unwrap();
@@ -3130,11 +3924,7 @@ mod tests {
 
         // Verify the index type and parameters match
         let target_vector_index = target_dataset
-            .open_vector_index(
-                "vector",
-                &target_indices[0].uuid.to_string(),
-                &NoOpMetricsCollector,
-            )
+            .open_vector_index("vector", &target_indices[0].uuid, &NoOpMetricsCollector)
             .await
             .unwrap();
         let stats = target_vector_index.statistics().unwrap();
@@ -3156,17 +3946,13 @@ mod tests {
         // Check number of partitions
         assert_eq!(
             stats.get("num_partitions").and_then(|v| v.as_u64()),
-            Some(8),
-            "Should have 8 partitions"
+            Some(2),
+            "Should have 2 partitions"
         );
 
         // Verify centroids are shared between source and target indices
         let source_vector_index = source_dataset
-            .open_vector_index(
-                "vector",
-                &source_index.uuid.to_string(),
-                &NoOpMetricsCollector,
-            )
+            .open_vector_index("vector", &source_index.uuid, &NoOpMetricsCollector)
             .await
             .unwrap();
 
@@ -3222,13 +4008,13 @@ mod tests {
         // Verify PQ parameters
         assert_eq!(
             sub_index.get("nbits").and_then(|v| v.as_u64()),
-            Some(8),
-            "PQ should use 8 bits"
+            Some(4),
+            "PQ should use 4 bits"
         );
         assert_eq!(
             sub_index.get("num_sub_vectors").and_then(|v| v.as_u64()),
-            Some(8),
-            "PQ should have 8 sub vectors"
+            Some(2),
+            "PQ should have 2 sub vectors"
         );
 
         // Verify IVF parameters are correctly derived
@@ -3240,8 +4026,8 @@ mod tests {
         );
         assert_eq!(
             target_ivf_params.num_partitions,
-            Some(8),
-            "Should have 8 partitions as configured"
+            Some(2),
+            "Should have 2 partitions as configured"
         );
 
         // Verify PQ parameters are correctly derived
@@ -3262,29 +4048,29 @@ mod tests {
             "PQ num_bits should match"
         );
         assert_eq!(
-            target_pq_params.num_sub_vectors, 8,
-            "PQ should have 8 sub vectors"
+            target_pq_params.num_sub_vectors, 2,
+            "PQ should have 2 sub vectors"
         );
-        assert_eq!(target_pq_params.num_bits, 8, "PQ should use 8 bits");
+        assert_eq!(target_pq_params.num_bits, 4, "PQ should use 4 bits");
 
         // Verify HNSW parameters are extracted and used correctly
         let derived_hnsw_params = derive_hnsw_params(target_vector_index.as_ref());
         assert_eq!(
-            derived_hnsw_params.max_level, 6,
-            "HNSW max_level should be extracted as 6 from source index"
+            derived_hnsw_params.max_level, 2,
+            "HNSW max_level should be extracted as 2 from source index"
         );
         assert_eq!(
-            derived_hnsw_params.m, 24,
-            "HNSW m should be extracted as 24 from source index"
+            derived_hnsw_params.m, 4,
+            "HNSW m should be extracted as 4 from source index"
         );
         assert_eq!(
-            derived_hnsw_params.ef_construction, 120,
-            "HNSW ef_construction should be extracted as 120 from source index"
+            derived_hnsw_params.ef_construction, 16,
+            "HNSW ef_construction should be extracted as 16 from source index"
         );
 
         // Verify the index is functional
         let query_vector = lance_datagen::gen_batch()
-            .anon_col(array::rand_vec::<Float32Type>(32.into()))
+            .anon_col(array::rand_vec::<Float32Type>(8.into()))
             .into_batch_rows(RowCount::from(1))
             .unwrap()
             .column(0)
@@ -3388,11 +4174,7 @@ mod tests {
 
         // Verify the index type and parameters match
         let target_vector_index = target_dataset
-            .open_vector_index(
-                "vector",
-                &target_indices[0].uuid.to_string(),
-                &NoOpMetricsCollector,
-            )
+            .open_vector_index("vector", &target_indices[0].uuid, &NoOpMetricsCollector)
             .await
             .unwrap();
         let stats = target_vector_index.statistics().unwrap();
@@ -3420,11 +4202,7 @@ mod tests {
 
         // Verify centroids are shared between source and target indices
         let source_vector_index = source_dataset
-            .open_vector_index(
-                "vector",
-                &source_index.uuid.to_string(),
-                &NoOpMetricsCollector,
-            )
+            .open_vector_index("vector", &source_index.uuid, &NoOpMetricsCollector)
             .await
             .unwrap();
 

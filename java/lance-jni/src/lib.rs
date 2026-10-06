@@ -51,9 +51,12 @@ mod file_reader;
 mod file_writer;
 mod fragment;
 mod index;
+mod index_progress;
+mod mem_wal;
 mod merge_insert;
 mod namespace;
 mod optimize;
+mod otel;
 mod schema;
 mod session;
 mod sql;
@@ -61,6 +64,7 @@ mod storage_options;
 mod task_tracker;
 pub mod traits;
 mod transaction;
+mod update;
 pub mod utils;
 mod vector_trainer;
 
@@ -82,6 +86,22 @@ pub static RT: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
         .build()
         .expect("Failed to create tokio runtime")
 });
+
+/// Drive a future on the shared JNI runtime, including nested calls.
+///
+/// Progress callbacks (and similar JNI re-entry) may invoke Dataset methods while
+/// already inside `RT.block_on`. Calling `Runtime::block_on` again panics with
+/// "Cannot start a runtime from within a runtime". When a Tokio handle is already
+/// available, use `block_in_place` + `Handle::block_on` instead.
+///
+/// JNI entry points should use this helper instead of calling `RT.block_on`
+/// directly so they remain safe when invoked from a callback.
+pub fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(future)),
+        Err(_) => RT.block_on(future),
+    }
+}
 
 fn set_timestamp_precision(builder: &mut env_logger::Builder) {
     if let Ok(timestamp_precision) = env::var("LANCE_LOG_TS_PRECISION") {
@@ -161,10 +181,25 @@ pub extern "system" fn JNI_OnLoad(
     vm: jni::JavaVM,
     _reserved: *mut std::ffi::c_void,
 ) -> jni::sys::jint {
+    // Resolve AsyncScanner class on the current thread which has the correct
+    // application classloader. A newly spawned native thread only gets the
+    // system classloader after attach_current_thread_permanently(), which
+    // cannot find application classes in environments like Spark, web
+    // containers, or shaded JARs.
+    let mut env = vm.get_env().expect("Failed to get JNIEnv in JNI_OnLoad");
+    let async_scanner_local = env
+        .find_class("org/lance/ipc/AsyncScanner")
+        .expect("AsyncScanner class not found");
+    let async_scanner_class = env
+        .new_global_ref(async_scanner_local)
+        .expect("Failed to create GlobalRef for AsyncScanner class");
+
     let jvm_arc = Arc::new(vm);
 
-    // Initialize global dispatcher with persistent thread
-    let dispatcher = dispatcher::Dispatcher::initialize(jvm_arc);
+    // Initialize global dispatcher with persistent thread, passing the
+    // pre-resolved class reference so the dispatcher thread does not need
+    // to look up the class with the wrong classloader.
+    let dispatcher = dispatcher::Dispatcher::initialize(jvm_arc, async_scanner_class);
 
     // Set the global DISPATCHER (will panic if called more than once)
     dispatcher::DISPATCHER

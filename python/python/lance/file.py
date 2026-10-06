@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
@@ -25,6 +26,7 @@ from .lance import (
 )
 
 if TYPE_CHECKING:
+    from .blob import DedicatedBlobWriter, PackedBlobWriter
     from .namespace import LanceNamespace
 
 
@@ -207,6 +209,26 @@ class LanceFileReader:
         return self._reader.num_rows()
 
 
+@dataclass
+class ListResult:
+    """
+    Result of a non-recursive, delimited list (see
+    :meth:`LanceFileSession.list_with_delimiter`).
+
+    Attributes
+    ----------
+    common_prefixes : List[str]
+        The immediate child "directories" of the listed path, relative to the
+        session's base path.
+    objects : List[str]
+        The immediate child files of the listed path, relative to the session's
+        base path.
+    """
+
+    common_prefixes: List[str]
+    objects: List[str]
+
+
 class LanceFileSession:
     """
     A file session for reading and writing Lance files.
@@ -286,7 +308,8 @@ class LanceFileSession:
             If provided, creates a schema-bound writer; otherwise a lazy writer is
             created.
         data_cache_bytes : int, optional
-            Size of the row-group/page write cache in bytes.
+            Total bytes to buffer for column data before writing pages. The
+            budget is divided evenly across top-level columns.
         version : str, optional
             Lance file format version (e.g. "2"). Parsed by the Rust layer.
         keep_original_array : bool, optional
@@ -310,6 +333,24 @@ class LanceFileSession:
             None,  # pyright: ignore[reportArgumentType]
             _inner_writer=inner,
         )
+
+    def open_packed_blob_writer(self, path: str, blob_id: int) -> "PackedBlobWriter":
+        """
+        Opens a packed blob writer for the given data file path.
+
+        The path will be appended to the base path of the session.
+        """
+        return self._session.open_packed_blob_writer(path, blob_id)
+
+    def open_dedicated_blob_writer(
+        self, path: str, blob_id: int
+    ) -> "DedicatedBlobWriter":
+        """
+        Opens a dedicated blob writer for the given data file path.
+
+        The path will be appended to the base path of the session.
+        """
+        return self._session.open_dedicated_blob_writer(path, blob_id)
 
     def contains(self, path: str) -> bool:
         """
@@ -343,6 +384,66 @@ class LanceFileSession:
             List of file paths.
         """
         return self._session.list(path)
+
+    def list_with_delimiter(self, path: Optional[str] = None) -> ListResult:
+        """
+        Non-recursively list a single directory level (relative to this
+        session's base path).
+
+        Unlike :meth:`list`, which recurses into the entire subtree, this
+        returns only the immediate children of ``path``: the child
+        "directories" as ``common_prefixes`` and the direct child files as
+        ``objects``.
+
+        Parameters
+        ----------
+        path : str, optional
+            Path relative to `base_path` to list. If None, lists the base path.
+
+        Returns
+        -------
+        ListResult
+            The immediate child prefixes and objects of `path`.
+        """
+        common_prefixes, objects = self._session.list_with_delimiter(path)
+        return ListResult(common_prefixes=common_prefixes, objects=objects)
+
+    def read_range(self, path: str, offset: int, length: int) -> bytes:
+        """
+        Read a byte range from a file (relative to this session's base path).
+
+        Issues a single ranged read. Reading a missing object raises
+        ``OSError``, consistent with ``download_file``.
+
+        Parameters
+        ----------
+        path : str
+            Path relative to `base_path` to read from.
+        offset : int
+            Byte offset at which to start reading.
+        length : int
+            Number of bytes to read.
+
+        Returns
+        -------
+        bytes
+            The requested byte range.
+        """
+        return self._session.read_range(path, offset, length)
+
+    def delete_file(self, path: str) -> None:
+        """
+        Delete a file (relative to this session's base path).
+
+        Deleting a path that does not exist raises ``OSError``, consistent with
+        ``download_file``.
+
+        Parameters
+        ----------
+        path : str
+            Path relative to `base_path` to delete.
+        """
+        self._session.delete_file(path)
 
     def upload_file(self, local_path: Union[str, Path], remote_path: str) -> None:
         """
@@ -382,6 +483,12 @@ class LanceFileWriter:
     This class is used to write Lance data files, a low level structure
     optimized for storing multi-modal tabular data.  If you are working with
     Lance datasets then you should use the LanceDataset class instead.
+
+    Attributes
+    ----------
+    size_bytes: Optional[int]
+        The final size of the file in bytes.  This is None until `close` is
+        called.
     """
 
     def __init__(
@@ -411,8 +518,9 @@ class LanceFileWriter:
             the schema will be inferred from the first batch.  If the schema
             is not specified and no data is written then the write will fail.
         data_cache_bytes: int
-            How many bytes (per column) to cache before writing a page.  The
-            default is an appropriate value based on the filesystem.
+            Total bytes to buffer for column data before writing pages. The
+            budget is divided evenly across top-level columns. By default,
+            each column uses 8 MiB.
         version: str
             The version of the file format to write.  If not specified then
             the latest stable version will be used.  Newer versions are more
@@ -448,6 +556,7 @@ class LanceFileWriter:
                 **kwargs,
             )
         self.closed = False
+        self.size_bytes: Optional[int] = None
 
     def write_batch(self, batch: Union[pa.RecordBatch, pa.Table]) -> None:
         """
@@ -469,11 +578,17 @@ class LanceFileWriter:
         Write the file metadata and close the file
 
         Returns the number of rows written to the file
+
+        After this returns, ``size_bytes`` holds the final size of the file.  This
+        is reported by the writer itself, so it is available for object stores
+        without issuing a separate metadata request.
         """
         if self.closed:
             return
         self.closed = True
-        return self._writer.finish()
+        summary = self._writer.finish()
+        self.size_bytes = summary.size_bytes
+        return summary.num_rows
 
     def add_schema_metadata(self, key: str, value: str) -> None:
         """

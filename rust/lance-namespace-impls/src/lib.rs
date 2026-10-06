@@ -46,10 +46,13 @@
 //! # Note: GCP uses ADC; set GOOGLE_APPLICATION_CREDENTIALS env var for service account key
 //! # Note: GCP token duration cannot be configured; it's determined by the STS endpoint
 //! credential_vendor.gcp_service_account = "my-sa@project.iam.gserviceaccount.com"
+//! credential_vendor.gcp_workload_identity_provider = "projects/123456/locations/global/workloadIdentityPools/pool/providers/provider"
+//! credential_vendor.gcp_impersonation_service_account = "my-sa@project.iam.gserviceaccount.com"
 //!
 //! # Azure-specific properties (for az:// locations)
 //! credential_vendor.azure_account_name = "mystorageaccount"  # required for Azure
 //! credential_vendor.azure_tenant_id = "my-tenant-id"
+//! credential_vendor.azure_federated_client_id = "my-app-client-id"
 //! credential_vendor.azure_duration_millis = "3600000"  # 1 hour (default, up to 7 days)
 //! ```
 //!
@@ -67,6 +70,10 @@
 //! # Ok(())
 //! # }
 //! ```
+
+use std::collections::HashSet;
+
+use lance_namespace::NamespaceError;
 
 pub mod connect;
 pub mod context;
@@ -113,3 +120,38 @@ pub use rest::{RestNamespace, RestNamespaceBuilder};
 
 #[cfg(feature = "rest-adapter")]
 pub use rest_adapter::{RestAdapter, RestAdapterConfig, RestAdapterHandle};
+
+/// Validate the `on` match key of a merge insert request.
+///
+/// The columns form a composite key, so an empty list matches nothing and a repeated
+/// column adds a redundant equality to the join.
+pub(crate) fn merge_insert_on_columns<'a>(
+    on: Option<&'a [String]>,
+    operation: &str,
+) -> lance_core::Result<&'a [String]> {
+    let on = on.ok_or_else(|| {
+        lance_core::Error::from(NamespaceError::InvalidInput {
+            message: format!("'on' field is required for {}", operation),
+        })
+    })?;
+
+    if on.is_empty() {
+        return Err(NamespaceError::InvalidInput {
+            message: format!("'on' field must name at least one column for {}", operation),
+        }
+        .into());
+    }
+
+    let mut seen = HashSet::with_capacity(on.len());
+    if let Some(duplicate) = on.iter().find(|column| !seen.insert(*column)) {
+        return Err(NamespaceError::InvalidInput {
+            message: format!(
+                "'on' field for {} names column '{}' more than once: {:?}",
+                operation, duplicate, on
+            ),
+        }
+        .into());
+    }
+
+    Ok(on)
+}

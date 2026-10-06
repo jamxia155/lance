@@ -13,6 +13,7 @@
  */
 package org.lance;
 
+import org.lance.file.FileWriteOptions;
 import org.lance.namespace.LanceNamespace;
 import org.lance.namespace.model.DeclareTableRequest;
 import org.lance.namespace.model.DeclareTableResponse;
@@ -70,10 +71,13 @@ public class WriteDatasetBuilder {
   private WriteParams.WriteMode mode = WriteParams.WriteMode.CREATE;
   private Schema schema;
   private Map<String, String> storageOptions = new HashMap<>();
+  private Map<String, String> properties = new HashMap<>();
+  private Map<String, Map<String, String>> baseStoreParams = new HashMap<>();
   private boolean ignoreNamespaceStorageOptions = false;
   private Optional<Integer> maxRowsPerFile = Optional.empty();
   private Optional<Integer> maxRowsPerGroup = Optional.empty();
   private Optional<Long> maxBytesPerFile = Optional.empty();
+  private FileWriteOptions fileWriteOptions = FileWriteOptions.builder().build();
   private Optional<Boolean> enableStableRowIds = Optional.empty();
   private Optional<String> dataStorageVersion = Optional.empty();
   private Optional<List<BasePath>> initialBases = Optional.empty();
@@ -207,6 +211,42 @@ public class WriteDatasetBuilder {
   }
 
   /**
+   * Sets the table properties to forward to the namespace on table creation.
+   *
+   * <p>These are Lance-namespace <b>properties</b>: catalog-level key-value metadata stored by the
+   * namespace outside the Lance table (available even if the table manifest does not exist), as
+   * distinct from the manifest-stored {@code config} (read/write behavior) and {@code metadata}
+   * (business metadata), and from non-persisted {@code storageOptions}. They are attached to the
+   * underlying declareTable request via its {@code properties} field.
+   *
+   * <p>Only used when a namespace client is configured via namespaceClient()+tableId() and the
+   * write creates the table (CREATE mode). Ignored for direct-URI writes and for APPEND/OVERWRITE
+   * modes.
+   *
+   * @param properties Table properties to forward on declareTable
+   * @return this builder instance
+   */
+  public WriteDatasetBuilder properties(Map<String, String> properties) {
+    this.properties = new HashMap<>(properties);
+    return this;
+  }
+
+  /**
+   * Sets runtime-only object store parameters for registered base paths.
+   *
+   * <p>Entries are keyed by the exact {@link BasePath#getPath()} value persisted in the manifest.
+   * Each value is used as-is for that base. These params are not persisted in the manifest. If a
+   * base has no explicit entry, the write-level storage options are used as a fallback.
+   *
+   * @param baseStoreParams object store parameters keyed by base path URI
+   * @return this builder instance
+   */
+  public WriteDatasetBuilder baseStoreParams(Map<String, Map<String, String>> baseStoreParams) {
+    this.baseStoreParams = new HashMap<>(baseStoreParams);
+    return this;
+  }
+
+  /**
    * Sets whether to ignore storage options from the namespace client's describeTable() or
    * declareTable().
    *
@@ -249,6 +289,18 @@ public class WriteDatasetBuilder {
    */
   public WriteDatasetBuilder maxBytesPerFile(long maxBytesPerFile) {
     this.maxBytesPerFile = Optional.of(maxBytesPerFile);
+    return this;
+  }
+
+  /**
+   * Sets options for configuring the current-format file writer.
+   *
+   * @param fileWriteOptions file writer options
+   * @return this builder instance
+   */
+  public WriteDatasetBuilder fileWriteOptions(FileWriteOptions fileWriteOptions) {
+    this.fileWriteOptions =
+        Preconditions.checkNotNull(fileWriteOptions, "fileWriteOptions must not be null");
     return this;
   }
 
@@ -394,6 +446,9 @@ public class WriteDatasetBuilder {
     if (mode == WriteParams.WriteMode.CREATE) {
       DeclareTableRequest declareRequest = new DeclareTableRequest();
       declareRequest.setId(tableId);
+      if (properties != null && !properties.isEmpty()) {
+        declareRequest.setProperties(properties);
+      }
       DeclareTableResponse declareResponse = namespaceClient.declareTable(declareRequest);
 
       tableUri = declareResponse.getLocation();
@@ -430,7 +485,11 @@ public class WriteDatasetBuilder {
 
     // Build WriteParams with merged storage options
     WriteParams.Builder paramsBuilder =
-        new WriteParams.Builder().withMode(mode).withStorageOptions(mergedStorageOptions);
+        new WriteParams.Builder()
+            .withMode(mode)
+            .withStorageOptions(mergedStorageOptions)
+            .withBaseStoreParams(baseStoreParams)
+            .withFileWriteOptions(fileWriteOptions);
 
     maxRowsPerFile.ifPresent(paramsBuilder::withMaxRowsPerFile);
     maxRowsPerGroup.ifPresent(paramsBuilder::withMaxRowsPerGroup);
@@ -465,7 +524,11 @@ public class WriteDatasetBuilder {
 
   private Dataset executeWithUri() {
     WriteParams.Builder paramsBuilder =
-        new WriteParams.Builder().withMode(mode).withStorageOptions(storageOptions);
+        new WriteParams.Builder()
+            .withMode(mode)
+            .withStorageOptions(storageOptions)
+            .withBaseStoreParams(baseStoreParams)
+            .withFileWriteOptions(fileWriteOptions);
 
     maxRowsPerFile.ifPresent(paramsBuilder::withMaxRowsPerFile);
     maxRowsPerGroup.ifPresent(paramsBuilder::withMaxRowsPerGroup);

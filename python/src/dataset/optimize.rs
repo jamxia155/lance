@@ -58,6 +58,9 @@ fn parse_compaction_options(
             "batch_size" => {
                 opts.batch_size = value.extract()?;
             }
+            "io_buffer_size" => {
+                opts.io_buffer_size = value.extract()?;
+            }
             "compaction_mode" => {
                 let mode_str: Option<String> = value.extract()?;
                 if let Some(mode_str) = mode_str {
@@ -73,6 +76,22 @@ fn parse_compaction_options(
             "max_source_fragments" => {
                 opts.max_source_fragments = value.extract()?;
             }
+            "max_source_rows" => {
+                opts.max_source_rows = value.extract()?;
+            }
+            "max_source_bytes" => {
+                opts.max_source_bytes = value.extract()?;
+            }
+            "excluded_fragment_ids" => {
+                opts.excluded_fragment_ids =
+                    value.extract::<Option<Vec<u32>>>()?.unwrap_or_default();
+            }
+            "data_storage_version" => {
+                let version: Option<String> = value.extract()?;
+                if let Some(version) = version {
+                    opts.data_storage_version = Some(version.parse().infer_error()?);
+                }
+            }
             _ => {
                 return Err(PyValueError::new_err(format!(
                     "Invalid compaction option: {}",
@@ -86,7 +105,8 @@ fn parse_compaction_options(
 }
 
 fn unwrap_dataset(dataset: Bound<PyAny>) -> PyResult<Bound<Dataset>> {
-    dataset.getattr("_ds")?.extract()
+    let ds = dataset.getattr("_ds")?;
+    Ok(ds.cast::<Dataset>()?.clone())
 }
 
 fn wrap_fragment<'py>(py: Python<'py>, fragment: &Fragment) -> PyResult<Bound<'py, PyAny>> {
@@ -229,7 +249,7 @@ impl PyCompactionPlan {
     }
 }
 
-#[pyclass(name = "CompactionTask", module = "lance.optimize")]
+#[pyclass(name = "CompactionTask", module = "lance.optimize", from_py_object)]
 #[derive(Clone)]
 pub struct PyCompactionTask(CompactionTask);
 
@@ -347,7 +367,7 @@ impl PyCompactionTask {
 ///
 /// This result is pickle-able, so it can be serialized and sent back to the
 /// main process to be passed to :py:meth:`lance.optimize.Compaction.commit`.
-#[pyclass(name = "RewriteResult", module = "lance.optimize")]
+#[pyclass(name = "RewriteResult", module = "lance.optimize", from_py_object)]
 #[derive(Clone)]
 pub struct PyRewriteResult(RewriteResult);
 
@@ -491,7 +511,7 @@ impl PyCompaction {
         let dataset = dataset_ref.borrow().clone();
         // Make sure we parse the options within a scoped GIL context, so we
         // aren't holding the GIL while blocking the thread on the operation.
-        let options = options.downcast::<PyDict>()?;
+        let options = options.cast::<PyDict>()?;
         let config = dataset.ds.manifest.config.clone();
         let opts = parse_compaction_options(options, &config)?;
         let mut new_ds = dataset.ds.as_ref().clone();
@@ -525,7 +545,7 @@ impl PyCompaction {
         let dataset = dataset.borrow().clone();
         // Make sure we parse the options within a scoped GIL context, so we
         // aren't holding the GIL while blocking the thread on the operation.
-        let options = options.downcast::<PyDict>()?;
+        let options = options.cast::<PyDict>()?;
         let config = dataset.ds.manifest.config.clone();
         let opts = parse_compaction_options(options, &config)?;
         let plan = rt()
@@ -550,26 +570,34 @@ impl PyCompaction {
     ///     new version once committed.
     /// rewrites : List[RewriteResult]
     ///     The results of the compaction tasks to include in the commit.
+    /// options : dict, optional
+    ///     Compaction options to apply at commit time.
+    ///     When absent or ``None``, defaults to ``CompactionOptions::default()``.
     ///
     /// Returns
     /// -------
     /// CompactionMetrics
     #[staticmethod]
+    #[pyo3(signature = (dataset, rewrites, options = None))]
     pub fn commit(
         dataset: Bound<PyAny>,
         rewrites: Vec<PyRewriteResult>,
+        options: Option<Bound<PyDict>>,
     ) -> PyResult<PyCompactionMetrics> {
         let dataset_ref = unwrap_dataset(dataset)?;
         let dataset = dataset_ref.borrow().clone();
+        let config = dataset.ds.manifest.config.clone();
+        let opts = match options {
+            Some(ref dict) => parse_compaction_options(dict, &config)?,
+            None => CompactionOptions::default(),
+        };
         let rewrites: Vec<RewriteResult> = rewrites.into_iter().map(|r| r.0).collect();
         let mut new_ds = dataset.ds.as_ref().clone();
-        // TODO: pass compaction option from plan and execute time
-        let options: CompactionOptions = CompactionOptions::default();
         let fut = commit_compaction(
             &mut new_ds,
             rewrites,
             Arc::new(DatasetIndexRemapperOptions::default()),
-            &options,
+            &opts,
         );
         let metrics = rt()
             .block_on(None, fut)?

@@ -18,8 +18,10 @@ import org.lance.index.IndexParams;
 import org.lance.index.vector.HnswBuildParams;
 import org.lance.index.vector.IvfBuildParams;
 import org.lance.index.vector.PQBuildParams;
+import org.lance.index.vector.RQBuildParams;
 import org.lance.index.vector.SQBuildParams;
 import org.lance.index.vector.VectorIndexParams;
+import org.lance.ipc.ApproxMode;
 import org.lance.ipc.Query;
 import org.lance.test.JniTestHelper;
 
@@ -28,6 +30,7 @@ import org.junit.jupiter.api.Test;
 import java.util.Arrays;
 import java.util.Optional;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 public class JNITest {
@@ -48,6 +51,19 @@ public class JNITest {
 
   @Test
   public void testQuery() {
+    Query defaultQuery =
+        new Query.Builder().setColumn("column").setKey(new float[] {1.0f, 2.0f, 3.0f}).build();
+    assertEquals(ApproxMode.NORMAL, defaultQuery.getApproxMode());
+
+    Query nprobesQuery =
+        new Query.Builder()
+            .setColumn("column")
+            .setKey(new float[] {1.0f, 2.0f, 3.0f})
+            .setNprobes(20)
+            .build();
+    assertEquals(20, nprobesQuery.getMinimumNprobes());
+    assertEquals(Optional.of(20), nprobesQuery.getMaximumNprobes());
+
     JniTestHelper.parseQuery(
         Optional.of(
             new Query.Builder()
@@ -59,6 +75,8 @@ public class JNITest {
                 .setRefineFactor(40)
                 .setDistanceType(DistanceType.L2)
                 .setUseIndex(true)
+                .setQueryParallelism(-1)
+                .setApproxMode(ApproxMode.ACCURATE)
                 .build()));
   }
 
@@ -68,6 +86,11 @@ public class JNITest {
         IndexParams.builder()
             .setVectorIndexParams(VectorIndexParams.ivfFlat(10, DistanceType.L2))
             .build());
+  }
+
+  @Test
+  public void testRqBuildParamsDefaultNumBits() {
+    assertEquals((byte) 5, new RQBuildParams.Builder().build().getNumBits());
   }
 
   @Test

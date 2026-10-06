@@ -11,7 +11,7 @@
 //! `RowDatasetVersionMeta::Inline` bytes across many fragments.
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use deepsize::DeepSizeOf;
+use lance_core::deepsize::DeepSizeOf;
 use prost::Message;
 
 use lance_table::format::pb;
@@ -59,6 +59,7 @@ fn make_uniform_pb_fragments(n: u64, num_fields: usize) -> Vec<pb::DataFragment>
                 file_size_bytes: 0,
                 base_id: None,
             }],
+            overlays: vec![],
             deletion_file: None,
             row_id_sequence: None,
             physical_rows: 1000,
@@ -135,6 +136,7 @@ fn make_diverse_pb_fragments(
                     file_size_bytes: 0,
                     base_id: None,
                 }],
+                overlays: vec![],
                 deletion_file: None,
                 row_id_sequence: None,
                 physical_rows: 1000,
@@ -253,7 +255,7 @@ fn bench_memory(c: &mut Criterion) {
 #[cfg(target_os = "linux")]
 criterion_group!(
     name = benches;
-    config = Criterion::default().with_profiler(pprof::criterion::PProfProfiler::new(100, pprof::criterion::Output::Flamegraph(None)));
+    config = Criterion::default().with_profiler(lance_testing::pprof::PProfProfiler::new(100, lance_testing::pprof::Output::Flamegraph(None)));
     targets = bench_deserialization, bench_memory
 );
 #[cfg(not(target_os = "linux"))]

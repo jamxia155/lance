@@ -57,6 +57,7 @@ public class OpenDatasetBuilder {
   private LanceNamespace namespaceClient;
   private List<String> tableId;
   private ReadOptions options = new ReadOptions.Builder().build();
+  private Map<String, Map<String, String>> baseStoreParams = new HashMap<>();
   private Session session;
 
   /** Creates a new builder instance. Package-private, use Dataset.open() instead. */
@@ -124,6 +125,22 @@ public class OpenDatasetBuilder {
    */
   public OpenDatasetBuilder readOptions(ReadOptions options) {
     this.options = options;
+    this.baseStoreParams = options.getBaseStoreParams();
+    return this;
+  }
+
+  /**
+   * Sets runtime-only object store parameters for registered base paths.
+   *
+   * <p>Entries are keyed by the exact {@link BasePath#getPath()} value persisted in the manifest.
+   * Each value is used as-is for that base. These params are not persisted in the manifest. If a
+   * base has no explicit entry, the read options storage options are used as a fallback.
+   *
+   * @param baseStoreParams object store parameters keyed by base path URI
+   * @return this builder instance
+   */
+  public OpenDatasetBuilder baseStoreParams(Map<String, Map<String, String>> baseStoreParams) {
+    this.baseStoreParams = new HashMap<>(baseStoreParams);
     return this;
   }
 
@@ -192,15 +209,15 @@ public class OpenDatasetBuilder {
     }
 
     // Handle URI-based opening
-    return Dataset.open(allocator, selfManagedAllocator, uri, options, session);
+    return Dataset.open(allocator, selfManagedAllocator, uri, options, baseStoreParams, session);
   }
 
   private Dataset buildFromNamespaceClient() {
     // Call describe_table to get location and storage options
     DescribeTableRequest request = new DescribeTableRequest();
     request.setId(tableId);
-    // Only set version if present
-    options.getVersion().ifPresent(v -> request.setVersion(Long.valueOf(v)));
+    // Do not set the dataset version here. Some namespace implementations only support describing
+    // the latest table metadata; the requested version is applied when opening the dataset below.
 
     DescribeTableResponse response = namespaceClient.describeTable(request);
 
@@ -220,8 +237,10 @@ public class OpenDatasetBuilder {
             .setMetadataCacheSizeBytes(options.getMetadataCacheSizeBytes());
 
     options.getVersion().ifPresent(optionsBuilder::setVersion);
+    options.getRef().ifPresent(optionsBuilder::setRef);
     options.getBlockSize().ifPresent(optionsBuilder::setBlockSize);
     options.getSerializedManifest().ifPresent(optionsBuilder::setSerializedManifest);
+    optionsBuilder.setBaseStoreParams(baseStoreParams);
 
     Map<String, String> storageOptions = new HashMap<>(options.getStorageOptions());
     if (namespaceStorageOptions != null) {
@@ -239,6 +258,7 @@ public class OpenDatasetBuilder {
         selfManagedAllocator,
         location,
         optionsBuilder.build(),
+        baseStoreParams,
         session,
         namespaceClient,
         tableId,

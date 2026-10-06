@@ -9,17 +9,19 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 use lance_namespace::LanceNamespace as LanceNamespaceTrait;
+use lance_namespace::compat::merge_insert_request_from_json;
 use lance_namespace::models::{
-    AlterTableAddColumnsRequest, AlterTableAlterColumnsRequest, AlterTableDropColumnsRequest,
-    AlterTransactionRequest, AnalyzeTableQueryPlanRequest, CountTableRowsRequest,
-    CreateTableIndexRequest, CreateTableTagRequest, CreateTableVersionRequest,
-    CreateTableVersionResponse, DeleteFromTableRequest, DeleteTableTagRequest,
-    DescribeTableIndexStatsRequest, DescribeTableRequest, DescribeTableResponse,
-    DescribeTableVersionRequest, DescribeTableVersionResponse, DescribeTransactionRequest,
-    DropTableIndexRequest, ExplainTableQueryPlanRequest, GetTableStatsRequest,
-    GetTableTagVersionRequest, InsertIntoTableRequest, ListTableIndicesRequest,
-    ListTableTagsRequest, ListTableVersionsRequest, ListTableVersionsResponse, ListTablesRequest,
-    MergeInsertIntoTableRequest, QueryTableRequest, RestoreTableRequest, UpdateTableRequest,
+    AlterTableAddColumnsRequest, AlterTableAlterColumnsRequest, AlterTableBackfillColumnsRequest,
+    AlterTableDropColumnsRequest, AlterTransactionRequest, AnalyzeTableQueryPlanRequest,
+    CountTableRowsRequest, CreateMaterializedViewRequest, CreateTableIndexRequest,
+    CreateTableTagRequest, CreateTableVersionRequest, CreateTableVersionResponse,
+    DeleteFromTableRequest, DeleteTableTagRequest, DescribeTableIndexStatsRequest,
+    DescribeTableRequest, DescribeTableResponse, DescribeTableVersionRequest,
+    DescribeTableVersionResponse, DescribeTransactionRequest, DropTableIndexRequest,
+    ExplainTableQueryPlanRequest, GetTableStatsRequest, GetTableTagVersionRequest,
+    InsertIntoTableRequest, ListTableIndicesRequest, ListTableTagsRequest,
+    ListTableVersionsRequest, ListTableVersionsResponse, ListTablesRequest, QueryTableRequest,
+    RefreshMaterializedViewRequest, RestoreTableRequest, UpdateTableRequest,
     UpdateTableSchemaMetadataRequest, UpdateTableTagRequest,
 };
 use lance_namespace_impls::RestNamespaceBuilder;
@@ -86,7 +88,7 @@ impl DynamicContextProvider for PyDynamicContextProvider {
                 Ok(headers_py) => {
                     // Convert Python dict to Rust HashMap
                     let bound_headers = headers_py.bind(py);
-                    if let Ok(dict) = bound_headers.downcast::<PyDict>() {
+                    if let Ok(dict) = bound_headers.cast::<PyDict>() {
                         dict_to_hashmap(dict).unwrap_or_default()
                     } else {
                         log::warn!("Context provider did not return a dict");
@@ -390,6 +392,44 @@ impl PyDirectoryNamespace {
         pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
+    // Table branch operations
+
+    fn create_table_branch<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.create_table_branch(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    fn list_table_branches<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.list_table_branches(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    fn delete_table_branch<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.delete_table_branch(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
     // Data manipulation operations
 
     fn count_table_rows(&self, py: Python, request: &Bound<'_, PyAny>) -> PyResult<i64> {
@@ -420,7 +460,7 @@ impl PyDirectoryNamespace {
         request: &Bound<'_, PyAny>,
         request_data: &Bound<'_, PyBytes>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let request: MergeInsertIntoTableRequest = depythonize(request)?;
+        let request = merge_insert_request_from_json(depythonize(request)?).infer_error()?;
         let data = Bytes::copy_from_slice(request_data.as_bytes());
         let response = crate::rt()
             .block_on(Some(py), self.inner.merge_insert_into_table(request, data))?
@@ -656,6 +696,42 @@ impl PyDirectoryNamespace {
         let request: AlterTableDropColumnsRequest = depythonize(request)?;
         let response = crate::rt()
             .block_on(Some(py), self.inner.alter_table_drop_columns(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    fn alter_table_backfill_columns<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request: AlterTableBackfillColumnsRequest = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.alter_table_backfill_columns(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    fn refresh_materialized_view<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request: RefreshMaterializedViewRequest = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.refresh_materialized_view(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    fn create_materialized_view<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request: CreateMaterializedViewRequest = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.create_materialized_view(request))?
             .infer_error()?;
         pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
@@ -1016,6 +1092,44 @@ impl PyRestNamespace {
         pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
+    // Table branch operations
+
+    fn create_table_branch<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.create_table_branch(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    fn list_table_branches<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.list_table_branches(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    fn delete_table_branch<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.delete_table_branch(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
     // Data manipulation operations
 
     fn count_table_rows(&self, py: Python, request: &Bound<'_, PyAny>) -> PyResult<i64> {
@@ -1046,7 +1160,7 @@ impl PyRestNamespace {
         request: &Bound<'_, PyAny>,
         request_data: &Bound<'_, PyBytes>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let request: MergeInsertIntoTableRequest = depythonize(request)?;
+        let request = merge_insert_request_from_json(depythonize(request)?).infer_error()?;
         let data = Bytes::copy_from_slice(request_data.as_bytes());
         let response = crate::rt()
             .block_on(Some(py), self.inner.merge_insert_into_table(request, data))?
@@ -1286,6 +1400,42 @@ impl PyRestNamespace {
         pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
+    fn alter_table_backfill_columns<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request: AlterTableBackfillColumnsRequest = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.alter_table_backfill_columns(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    fn refresh_materialized_view<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request: RefreshMaterializedViewRequest = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.refresh_materialized_view(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    fn create_materialized_view<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request: CreateMaterializedViewRequest = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.create_materialized_view(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
     // Table tag operations
 
     fn list_table_tags<'py>(
@@ -1398,6 +1548,30 @@ fn get_dict_with_model_dump_class(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> 
     Ok(class)
 }
 
+/// Convert a Python namespace exception into a lance error, preserving the
+/// namespace error identity when the exception is a `lance_namespace`
+/// `LanceNamespaceError` carrying an error `code`, so callers can react to
+/// e.g. TableNotFound the same way they do for native clients. Foreign
+/// exceptions that happen to carry an integer `code` (e.g. SystemExit) must
+/// not be reinterpreted, so the extraction is gated on the exception type.
+fn namespace_error_from_py(method_name: &'static str, e: PyErr) -> lance_core::Error {
+    Python::attach(|py| {
+        let value = e.value(py);
+        let is_namespace_error = py
+            .import("lance_namespace.errors")
+            .and_then(|module| module.getattr("LanceNamespaceError"))
+            .and_then(|class| value.is_instance(&class))
+            .unwrap_or(false);
+        if is_namespace_error
+            && let Ok(code) = value.getattr("code").and_then(|code| code.extract::<u32>())
+        {
+            return lance_namespace::error::NamespaceError::from_code(code, value.to_string())
+                .into();
+        }
+        lance_core::Error::io(format!("Python error in {}: {}", method_name, e))
+    })
+}
+
 /// Helper to call a Python namespace method with JSON serialization.
 /// For methods that take a request and return a response.
 /// Uses DictWithModelDump to pass a dict that also has model_dump() method,
@@ -1445,7 +1619,7 @@ where
     })
     .await
     .map_err(|e| lance_core::Error::io(format!("Task join error for {}: {}", method_name, e)))?
-    .map_err(|e: PyErr| lance_core::Error::io(format!("Python error in {}: {}", method_name, e)))?;
+    .map_err(|e: PyErr| namespace_error_from_py(method_name, e))?;
 
     serde_json::from_str(&response_json).map_err(|e| {
         lance_core::Error::io(format!(
@@ -1549,10 +1723,10 @@ pub fn extract_namespace_arc(
     namespace_client: &Bound<'_, PyAny>,
 ) -> PyResult<Arc<dyn LanceNamespaceTrait>> {
     // Direct PyO3 class
-    if let Ok(dir_namespace_client) = namespace_client.downcast::<PyDirectoryNamespace>() {
+    if let Ok(dir_namespace_client) = namespace_client.cast::<PyDirectoryNamespace>() {
         return Ok(dir_namespace_client.borrow().inner.clone() as Arc<dyn LanceNamespaceTrait>);
     }
-    if let Ok(rest_namespace_client) = namespace_client.downcast::<PyRestNamespace>() {
+    if let Ok(rest_namespace_client) = namespace_client.cast::<PyRestNamespace>() {
         return Ok(rest_namespace_client.borrow().inner.clone() as Arc<dyn LanceNamespaceTrait>);
     }
 
@@ -1565,13 +1739,13 @@ pub fn extract_namespace_arc(
             .unwrap_or_default();
 
         if type_name == "DirectoryNamespace" {
-            if let Ok(dir_namespace_client) = inner.downcast::<PyDirectoryNamespace>() {
+            if let Ok(dir_namespace_client) = inner.cast::<PyDirectoryNamespace>() {
                 return Ok(
                     dir_namespace_client.borrow().inner.clone() as Arc<dyn LanceNamespaceTrait>
                 );
             }
         } else if type_name == "RestNamespace"
-            && let Ok(rest_namespace_client) = inner.downcast::<PyRestNamespace>()
+            && let Ok(rest_namespace_client) = inner.cast::<PyRestNamespace>()
         {
             return Ok(rest_namespace_client.borrow().inner.clone() as Arc<dyn LanceNamespaceTrait>);
         }

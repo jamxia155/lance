@@ -7,17 +7,19 @@ use arrow_array::{
     Float16Array, Float32Array, Float64Array,
     types::{Float16Type, Float32Type, Float64Type},
 };
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use std::hint::black_box;
+
+use criterion::{Criterion, criterion_group, criterion_main};
 use half::{bf16, f16};
 use num_traits::Float;
 use rand::Rng;
 
 use lance_arrow::{ArrowFloatType, FloatArray, bfloat16::BFloat16Type};
-use lance_linalg::distance::{norm_l2, norm_l2_impl};
+use lance_linalg::distance::{norm_l2, norm_l2_f64_simd, norm_l2_impl};
 use lance_testing::datagen::generate_random_array_with_seed;
 
 #[cfg(target_os = "linux")]
-use pprof::criterion::{Output, PProfProfiler};
+use lance_testing::pprof::{Output, PProfProfiler};
 
 const DIMENSION: usize = 1024;
 const TOTAL: usize = 1024 * 1024; // 1M vectors
@@ -48,8 +50,10 @@ fn run_bench<T: ArrowFloatType>(
             b.iter(|| {
                 black_box(
                     target
-                        .chunks_exact(DIMENSION)
-                        .map(auto_vec_impl)
+                        .as_chunks::<DIMENSION>()
+                        .0
+                        .iter()
+                        .map(|v| auto_vec_impl(v))
                         .collect::<Vec<_>>(),
                 );
             });
@@ -63,8 +67,10 @@ fn run_bench<T: ArrowFloatType>(
                 b.iter(|| {
                     black_box(
                         target
-                            .chunks_exact(DIMENSION)
-                            .map(simd_impl)
+                            .as_chunks::<DIMENSION>()
+                            .0
+                            .iter()
+                            .map(|v| simd_impl(v))
                             .collect::<Vec<_>>(),
                     );
                 });
@@ -106,7 +112,7 @@ fn bench_distance(c: &mut Criterion) {
         c,
         target.as_slice(),
         norm_l2_impl::<f64, f32, 8>,
-        None, // TODO: implement SIMD for f64
+        Some(norm_l2_f64_simd),
     );
 }
 

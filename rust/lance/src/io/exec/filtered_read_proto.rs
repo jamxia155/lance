@@ -20,77 +20,18 @@ use datafusion::execution::SessionState;
 use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::ExecutionPlan;
 use lance_core::datatypes::{BlobHandling, Projection};
-use lance_core::utils::mask::RowAddrTreeMap;
 use lance_core::{Error, Result};
 use lance_datafusion::pb;
 use lance_datafusion::substrait::{encode_substrait, parse_substrait, prune_schema_for_substrait};
-use lance_io::object_store::StorageOptions;
+use lance_select::RowAddrTreeMap;
 use lance_table::format::Fragment;
-use prost::Message;
 
 use crate::Dataset;
-use crate::dataset::builder::DatasetBuilder;
 
 use super::filtered_read::{
     FilteredReadExec, FilteredReadOptions, FilteredReadPlan, FilteredReadThreadingMode,
 };
-
-// =============================================================================
-// TableIdentifier helpers (reusable by other execs)
-// =============================================================================
-
-/// Build a [`TableIdentifier`] from a [`Dataset`].
-///
-/// Default: lightweight mode (uri + version + etag only, no serialized manifest).
-/// Includes the dataset's latest storage options (if any) so the remote executor
-/// can open or cache the dataset with the correct storage configuration.
-pub async fn table_identifier_from_dataset(dataset: &Dataset) -> Result<pb::TableIdentifier> {
-    Ok(pb::TableIdentifier {
-        uri: dataset.uri().to_string(),
-        version: dataset.manifest.version,
-        manifest_etag: dataset.manifest_location.e_tag.clone(),
-        serialized_manifest: None,
-        storage_options: dataset
-            .latest_storage_options()
-            .await?
-            .map(|StorageOptions(m)| m)
-            .unwrap_or_default(),
-    })
-}
-
-/// Build a [`TableIdentifier`] with serialized manifest bytes included.
-///
-/// Fast path: remote executor skips manifest read from storage.
-pub async fn table_identifier_from_dataset_with_manifest(
-    dataset: &Dataset,
-) -> Result<pb::TableIdentifier> {
-    let manifest_proto = lance_table::format::pb::Manifest::from(dataset.manifest.as_ref());
-    Ok(pb::TableIdentifier {
-        uri: dataset.uri().to_string(),
-        version: dataset.manifest.version,
-        manifest_etag: dataset.manifest_location.e_tag.clone(),
-        serialized_manifest: Some(manifest_proto.encode_to_vec()),
-        storage_options: dataset
-            .latest_storage_options()
-            .await?
-            .map(|StorageOptions(m)| m)
-            .unwrap_or_default(),
-    })
-}
-
-/// Open a dataset from a table identifier proto
-pub async fn open_dataset_from_table_identifier(
-    table_id: &pb::TableIdentifier,
-) -> Result<Arc<Dataset>> {
-    let mut builder = DatasetBuilder::from_uri(&table_id.uri).with_version(table_id.version);
-    if let Some(manifest_bytes) = &table_id.serialized_manifest {
-        builder = builder.with_serialized_manifest(manifest_bytes)?;
-    }
-    if !table_id.storage_options.is_empty() {
-        builder = builder.with_storage_options(table_id.storage_options.clone());
-    }
-    Ok(Arc::new(builder.load().await?))
-}
+use super::table_identifier::{resolve_dataset, table_identifier_from_dataset};
 
 // =============================================================================
 // FilteredReadExec <-> Proto
@@ -131,17 +72,7 @@ pub async fn filtered_read_exec_from_proto(
     index_input: Option<Arc<dyn ExecutionPlan>>,
     state: &SessionState,
 ) -> Result<FilteredReadExec> {
-    let dataset = match dataset {
-        Some(ds) => ds, // dataset could be opened or cached by the caller
-        None => {
-            let table_id = proto.table.as_ref().ok_or_else(|| {
-                Error::invalid_input_source(
-                    "Missing table identifier in FilteredReadExecProto".into(),
-                )
-            })?;
-            open_dataset_from_table_identifier(table_id).await?
-        }
-    };
+    let dataset = resolve_dataset(dataset, proto.table.as_ref()).await?;
 
     let options_proto = proto.options.ok_or_else(|| {
         Error::invalid_input_source("Missing options in FilteredReadExecProto".into())
@@ -214,6 +145,11 @@ fn fr_options_to_proto(
         threading_mode: Some(threading_mode_to_proto(&options.threading_mode)),
         io_buffer_size_bytes: options.io_buffer_size_bytes,
         filter_schema_ipc,
+        materialization_readahead_bytes: options.materialization_readahead_bytes,
+        batch_size_bytes: options
+            .file_reader_options
+            .as_ref()
+            .and_then(|o| o.batch_size_bytes),
     })
 }
 
@@ -262,6 +198,17 @@ async fn fr_options_from_proto(
     }
     if let Some(io_buffer) = proto.io_buffer_size_bytes {
         options = options.with_io_buffer_size(io_buffer);
+    }
+    if let Some(materialization_readahead_bytes) = proto.materialization_readahead_bytes {
+        options = options.with_materialization_readahead_bytes(materialization_readahead_bytes);
+    }
+    if let Some(batch_size_bytes) = proto.batch_size_bytes {
+        // Merge the scanner-level byte budget into the dataset's existing
+        // file-reader options so that distributed execution preserves
+        // validation and I/O settings such as read_chunk_size.
+        let mut file_reader_options = dataset.file_reader_options.clone().unwrap_or_default();
+        file_reader_options.batch_size_bytes = Some(batch_size_bytes);
+        options = options.with_file_reader_options(file_reader_options);
     }
     if let Some(mode) = proto.threading_mode {
         options.threading_mode = threading_mode_from_proto(&mode)?;
@@ -510,21 +457,21 @@ fn range_from_proto(proto: &pb::U64Range) -> Range<u64> {
     proto.start..proto.end
 }
 
-fn fragments_from_proto(fragment_ids: &[u64], dataset: &Arc<Dataset>) -> Result<Vec<Fragment>> {
+fn fragments_from_proto(fragment_ids: &[u64], dataset: &Dataset) -> Result<Vec<Fragment>> {
+    let fragments = dataset.manifest.fragments.as_slice();
+    // Duplicate IDs in legacy manifests must resolve to their first stored fragment.
+    let ids_are_unique = dataset.fragment_bitmap.len() == fragments.len() as u64;
     fragment_ids
         .iter()
         .map(|id| {
-            dataset
-                .manifest
-                .fragments
-                .iter()
-                .find(|f| f.id == *id)
-                .cloned()
-                .ok_or_else(|| {
-                    Error::invalid_input_source(
-                        format!("Fragment {} not found in dataset", id).into(),
-                    )
-                })
+            let fragment = if ids_are_unique && u32::try_from(*id).is_ok() {
+                dataset.find_fragment(*id)
+            } else {
+                fragments.iter().find(|f| f.id == *id)
+            };
+            fragment.cloned().ok_or_else(|| {
+                Error::invalid_input_source(format!("Fragment {} not found in dataset", id).into())
+            })
         })
         .collect()
 }
@@ -556,12 +503,16 @@ mod tests {
     use arrow_schema::{DataType, Field};
     use datafusion::prelude::SessionContext;
     use lance_core::datatypes::OnMissing;
-    use lance_core::utils::mask::RowAddrTreeMap;
     use lance_datagen::{array, gen_batch};
+    use lance_select::RowAddrTreeMap;
     use roaring::RoaringBitmap;
+    use rstest::rstest;
+    use std::collections::HashMap;
     use std::collections::HashSet;
 
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+    use lance_encoding::decoder::DecoderConfig;
+    use lance_file::reader::FileReaderOptions;
 
     #[test]
     fn test_range_roundtrip() {
@@ -633,23 +584,6 @@ mod tests {
     }
 
     #[test]
-    fn test_table_identifier_without_manifest() {
-        let id = pb::TableIdentifier {
-            uri: "s3://bucket/table.lance".to_string(),
-            version: 42,
-            manifest_etag: Some("etag123".to_string()),
-            serialized_manifest: None,
-            storage_options: HashMap::new(),
-        };
-        let bytes = id.encode_to_vec();
-        let back = pb::TableIdentifier::decode(bytes.as_slice()).unwrap();
-        assert_eq!(id.uri, back.uri);
-        assert_eq!(id.version, back.version);
-        assert_eq!(id.manifest_etag, back.manifest_etag);
-        assert!(back.serialized_manifest.is_none());
-    }
-
-    #[test]
     fn test_row_addr_tree_map_roundtrip_in_plan_proto() {
         let mut rows = RowAddrTreeMap::new();
         let mut bitmap = RoaringBitmap::new();
@@ -673,9 +607,27 @@ mod tests {
         Arc::new(dataset)
     }
 
+    /// Create a test dataset with non-default file-reader options so that
+    /// round-trip tests can verify that scanner-level overrides preserve the
+    /// dataset-level defaults.
+    async fn make_test_dataset_with_file_reader_options() -> Arc<Dataset> {
+        let mut dataset = make_test_dataset().await;
+        if let Some(ds) = Arc::get_mut(&mut dataset) {
+            ds.file_reader_options = Some(FileReaderOptions {
+                read_chunk_size: 1234,
+                decoder_config: DecoderConfig {
+                    validate_on_decode: true,
+                    ..Default::default()
+                },
+                batch_size_bytes: None,
+            });
+        }
+        dataset
+    }
+
     #[tokio::test]
     async fn test_options_roundtrip_basic() {
-        let dataset = make_test_dataset().await;
+        let dataset = make_test_dataset_with_file_reader_options().await;
         let ctx = SessionContext::new();
         let state = ctx.state();
         let filter_schema = Arc::new(prune_schema_for_substrait(&dataset.schema().into()));
@@ -684,8 +636,13 @@ mod tests {
             .with_scan_range_before_filter(10..90)
             .unwrap()
             .with_batch_size(64)
+            .with_file_reader_options(FileReaderOptions {
+                batch_size_bytes: Some(4096),
+                ..Default::default()
+            })
             .with_fragment_readahead(4)
-            .with_io_buffer_size(1024 * 1024);
+            .with_io_buffer_size(1024 * 1024)
+            .with_materialization_readahead_bytes(8 * 1024 * 1024);
 
         let proto = fr_options_to_proto(&options, &filter_schema, &state).unwrap();
         let back = fr_options_from_proto(proto, &dataset, &state)
@@ -699,6 +656,24 @@ mod tests {
         assert_eq!(options.batch_size, back.batch_size);
         assert_eq!(options.fragment_readahead, back.fragment_readahead);
         assert_eq!(options.io_buffer_size_bytes, back.io_buffer_size_bytes);
+        assert_eq!(
+            options.materialization_readahead_bytes,
+            back.materialization_readahead_bytes
+        );
+        assert_eq!(
+            options
+                .file_reader_options
+                .as_ref()
+                .and_then(|o| o.batch_size_bytes),
+            back.file_reader_options
+                .as_ref()
+                .and_then(|o| o.batch_size_bytes)
+        );
+        // The scanner-level byte budget must be merged into the dataset's
+        // existing file-reader options, not replace them.
+        let effective = back.file_reader_options.as_ref().unwrap();
+        assert_eq!(effective.read_chunk_size, 1234);
+        assert!(effective.decoder_config.validate_on_decode);
         assert_eq!(options.threading_mode, back.threading_mode);
         assert_eq!(options.with_deleted_rows, back.with_deleted_rows);
         assert_eq!(options.projection.field_ids, back.projection.field_ids);
@@ -775,6 +750,82 @@ mod tests {
         );
     }
 
+    // Physical row counts distinguish fragments with the same ID.
+    async fn make_test_dataset_with_stored_ids(stored_ids: &[u64]) -> Dataset {
+        let fragments: Vec<_> = stored_ids
+            .iter()
+            .enumerate()
+            .map(|(position, id)| {
+                let mut fragment = Fragment::new(*id);
+                fragment.physical_rows = Some(position);
+                fragment
+            })
+            .collect();
+        let mut dataset = (*make_test_dataset().await).clone();
+        dataset.fragment_bitmap = Arc::new(
+            fragments
+                .iter()
+                .map(|fragment| fragment.id as u32)
+                .collect(),
+        );
+        Arc::make_mut(&mut dataset.manifest).fragments = Arc::new(fragments);
+        dataset
+    }
+
+    #[rstest]
+    #[case::sorted(&[0, 1, 2, 5, 8])]
+    #[case::unsorted(&[5, 0, 8, 2, 1])]
+    #[case::sorted_repeated(&[0, 1, 2, 2, 5, 8])]
+    // A binary search for 2 lands on the copy at position 3 of this list.
+    #[case::unsorted_repeated(&[2, 0, 1, 2, 5, 8])]
+    #[tokio::test]
+    async fn fragments_from_proto_returns_first_stored_fragment_in_request_order(
+        #[case] stored_ids: &[u64],
+    ) {
+        let dataset = make_test_dataset_with_stored_ids(stored_ids).await;
+        let requested_ids = [8, 2, 5, 0, 2, 1];
+
+        let resolved = fragments_from_proto(&requested_ids, &dataset).unwrap();
+
+        let first_stored = requested_ids
+            .iter()
+            .map(|id| {
+                dataset
+                    .manifest
+                    .fragments
+                    .iter()
+                    .find(|f| f.id == *id)
+                    .unwrap()
+                    .clone()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(resolved, first_stored);
+    }
+
+    #[tokio::test]
+    async fn fragments_from_proto_preserves_wide_fragment_ids() {
+        let id = u64::from(u32::MAX) + 1;
+        let dataset = make_test_dataset_with_stored_ids(&[id]).await;
+        let resolved = fragments_from_proto(&[id], &dataset).unwrap();
+        assert_eq!(resolved, dataset.manifest.fragments.as_ref().clone());
+    }
+
+    #[rstest]
+    #[case::sorted(&[0, 1, 2, 5, 8])]
+    #[case::unsorted_repeated(&[2, 0, 1, 2, 5, 8])]
+    #[tokio::test]
+    async fn fragments_from_proto_rejects_missing_id(#[case] stored_ids: &[u64]) {
+        let dataset = make_test_dataset_with_stored_ids(stored_ids).await;
+
+        let err = fragments_from_proto(&[1, 3], &dataset).unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }));
+
+        assert!(
+            err.to_string().contains("Fragment 3 not found"),
+            "unexpected error: {err}"
+        );
+    }
+
     #[tokio::test]
     async fn test_exec_to_proto_roundtrip() {
         let dataset = make_test_dataset().await;
@@ -812,21 +863,57 @@ mod tests {
         );
     }
 
+    /// A row-stream (take) exec serializes like any other: the input plan
+    /// travels as the node's child through the plan codec, and decoding
+    /// re-derives the row-stream selector from the child's schema
     #[tokio::test]
-    async fn test_table_identifier_with_manifest() {
-        let dataset = make_test_dataset().await;
+    async fn test_exec_to_proto_roundtrip_row_stream() {
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        use lance_core::{ROW_ID, ROW_ID_FIELD};
+        use lance_datafusion::exec::OneShotExec;
 
-        let id = table_identifier_from_dataset_with_manifest(&dataset)
-            .await
+        fn keys_input() -> Arc<dyn ExecutionPlan> {
+            let schema = Arc::new(ArrowSchema::new(vec![ROW_ID_FIELD.clone()]));
+            let batch = arrow_array::RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(arrow_array::UInt64Array::from(vec![3u64, 1, 4]))],
+            )
             .unwrap();
-        assert_eq!(id.uri, dataset.uri());
-        assert_eq!(id.version, dataset.manifest.version);
-        assert!(id.serialized_manifest.is_some());
+            let stream = futures::stream::iter(vec![Ok(batch)]);
+            Arc::new(OneShotExec::new(Box::pin(RecordBatchStreamAdapter::new(
+                schema, stream,
+            ))))
+        }
 
-        // Verify the serialized manifest bytes decode
-        let manifest_bytes = id.serialized_manifest.unwrap();
-        let _manifest_proto =
-            lance_table::format::pb::Manifest::decode(manifest_bytes.as_slice()).unwrap();
+        let dataset = make_test_dataset().await;
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+
+        let options = FilteredReadOptions::basic_full_read(&dataset);
+        let exec = FilteredReadExec::try_new(dataset.clone(), options, Some(keys_input())).unwrap();
+        assert!(exec.row_stream_input().is_some());
+
+        let proto = filtered_read_exec_to_proto(&exec, &state).await.unwrap();
+
+        // The codec hands the decoded child back; the selector re-derives
+        // from its schema
+        let back =
+            filtered_read_exec_from_proto(proto, Some(dataset.clone()), Some(keys_input()), &state)
+                .await
+                .unwrap();
+        assert!(back.row_stream_input().is_some());
+        assert_eq!(exec.schema(), back.schema());
+        assert_eq!(
+            exec.options().projection.field_ids,
+            back.options().projection.field_ids
+        );
+        assert!(
+            back.row_stream_input()
+                .unwrap()
+                .schema()
+                .column_with_name(ROW_ID)
+                .is_some()
+        );
     }
 
     #[tokio::test]

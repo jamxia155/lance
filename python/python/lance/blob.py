@@ -1,13 +1,39 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
+import ctypes
 import io
 from dataclasses import dataclass
 from typing import IO, Any, Iterator, Optional, Union
 
 import pyarrow as pa
 
-from .lance import LanceBlobFile
+from .lance import (
+    BlobDescriptor as BlobDescriptor,
+)
+from .lance import (
+    BlobDescriptorArrayBuilder as BlobDescriptorArrayBuilder,
+)
+from .lance import (
+    DedicatedBlobWriter as DedicatedBlobWriter,
+)
+from .lance import (
+    LanceBlobFile,
+)
+from .lance import (
+    PackedBlobWriter as PackedBlobWriter,
+)
+
+_BLOB_INLINE_SIZE_THRESHOLD_META_KEY = b"lance-encoding:blob-inline-size-threshold"
+_BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY = (
+    b"lance-encoding:blob-dedicated-size-threshold"
+)
+_BLOB_PACK_FILE_SIZE_THRESHOLD_META_KEY = (
+    b"lance-encoding:blob-pack-file-size-threshold"
+)
+_MAX_RUST_USIZE = ctypes.c_size_t(-1).value
+# Default sequential read-ahead size in bytes.
+DEFAULT_BLOB_BUFFER_SIZE = 512 * 1024
 
 
 @dataclass(frozen=True)
@@ -17,8 +43,10 @@ class Blob:
 
     A blob can be represented as:
     - inline bytes
-    - an external URI with position and size, if position and size are not set,
-      use the full uri.
+    - an external URI, optionally with a non-empty range
+
+    Every blob must use exactly one representation. Use ``None`` for a null
+    blob and :meth:`empty` for a valid empty blob.
     """
 
     data: Optional[bytes] = None
@@ -41,16 +69,22 @@ class Blob:
             raise ValueError(
                 "Blob cannot have both inline data and external slice metadata"
             )
+        if self.data is None and self.uri is None:
+            raise ValueError("Blob must set `data` or `uri`; use None for a null blob")
+        if self.size == 0:
+            raise ValueError("External blob range size must be greater than zero")
 
     @staticmethod
     def from_bytes(data: Union[bytes, bytearray, memoryview]) -> "Blob":
         return Blob(data=bytes(data))
 
     @staticmethod
-    def from_uri(uri: str, position: int = None, size: int = None) -> "Blob":
+    def from_uri(
+        uri: str, position: Optional[int] = None, size: Optional[int] = None
+    ) -> "Blob":
         if uri == "":
             raise ValueError("Blob uri cannot be empty")
-        if position < 0 or size < 0:
+        if (position is not None and position < 0) or (size is not None and size < 0):
             raise ValueError("External blob position and size must be non-negative")
         return Blob(uri=uri, position=position, size=size)
 
@@ -64,7 +98,13 @@ class BlobType(pa.ExtensionType):
     A PyArrow extension type for Lance blob columns.
 
     This is the "logical" type users write. Lance will store it in a compact
-    descriptor format, and reads will return descriptors by default.
+    descriptor format, and reads will return descriptors by default. Its storage
+    type defaults to ``Struct<data: LargeBinary?, uri: Utf8?, position: UInt64?,
+    size: UInt64?>``. Arrow deserialization also preserves the accepted minimal
+    ``Struct<data: LargeBinary?, uri: Utf8?>`` storage type. ``position`` and
+    ``size`` select a range within an external ``uri`` and must either both be set
+    or both be null. When set, ``size`` must be greater than zero. Every non-null
+    value must set exactly one of ``data`` and ``uri``.
     """
 
     def __init__(self) -> None:
@@ -81,11 +121,47 @@ class BlobType(pa.ExtensionType):
     def __arrow_ext_serialize__(self) -> bytes:
         return b""
 
+    @staticmethod
+    def _validate_storage_type(storage_type: pa.DataType) -> None:
+        if not pa.types.is_struct(storage_type):
+            raise TypeError("BlobType storage type must be a struct")
+
+        fields = list(storage_type)
+        if len(fields) not in (2, 4):
+            raise TypeError(
+                "BlobType storage struct must contain either data/uri or "
+                "data/uri/position/size"
+            )
+
+        expected_fields = [
+            ("data", pa.large_binary()),
+            ("uri", pa.utf8()),
+            ("position", pa.uint64()),
+            ("size", pa.uint64()),
+        ]
+        for index, field in enumerate(fields):
+            expected_name, expected_type = expected_fields[index]
+            if field.name != expected_name or field.type != expected_type:
+                raise TypeError(
+                    "BlobType storage field "
+                    f"{index} must be {expected_name}: {expected_type}, got "
+                    f"{field.name}: {field.type}"
+                )
+            if index < 2 and not field.nullable:
+                raise TypeError(f"BlobType storage field {field.name} must be nullable")
+
+    @classmethod
+    def _from_storage_type(cls, storage_type: pa.DataType) -> "BlobType":
+        cls._validate_storage_type(storage_type)
+        instance = cls.__new__(cls)
+        pa.ExtensionType.__init__(instance, storage_type, "lance.blob.v2")
+        return instance
+
     @classmethod
     def __arrow_ext_deserialize__(
         cls, storage_type: pa.DataType, serialized: bytes
     ) -> "BlobType":
-        return BlobType()
+        return cls._from_storage_type(storage_type)
 
     def __arrow_ext_class__(self):
         return BlobArray
@@ -188,9 +264,85 @@ def blob_array(values: list[Any]) -> BlobArray:
     return BlobArray.from_pylist(values)
 
 
-def blob_field(name: str, *, nullable: bool = True) -> pa.Field:
-    """Construct an Arrow field for a Lance blob column."""
-    return pa.field(name, BlobType(), nullable=nullable)
+def _validate_threshold(name: str, value: Optional[int], *, allow_zero: bool) -> None:
+    if value is None:
+        return
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} must be an int, got {type(value).__name__}")
+    if allow_zero:
+        if value < 0:
+            raise ValueError(f"{name} must be non-negative")
+    elif value <= 0:
+        raise ValueError(f"{name} must be positive")
+    if value > _MAX_RUST_USIZE:
+        raise OverflowError(f"{name} must fit in a Rust usize")
+
+
+def blob_field(
+    name: str,
+    *,
+    nullable: bool = True,
+    inline_size_threshold: Optional[int] = None,
+    dedicated_size_threshold: Optional[int] = None,
+    pack_file_size_threshold: Optional[int] = None,
+) -> pa.Field:
+    """
+    Construct an Arrow field for a Lance blob column.
+
+    The returned field uses the complete logical blob shape
+    ``Struct<data: LargeBinary?, uri: Utf8?, position: UInt64?, size: UInt64?>``.
+    Every non-null value must set exactly one of ``data`` and ``uri``. External
+    ranges must set both ``position`` and a positive ``size``. Lance preserves
+    this logical schema across create, append, and merge-insert writes while
+    storing compact descriptors internally.
+
+    Parameters
+    ----------
+    name : str
+        Field name.
+    nullable : bool, default True
+        Whether the blob column accepts null values.
+    inline_size_threshold : optional, int
+        Maximum payload size in bytes to keep inline in the data file before
+        using packed blob storage.
+    dedicated_size_threshold : optional, int
+        Maximum payload size in bytes to store in packed blob storage before
+        using dedicated blob storage. This threshold is checked before
+        ``inline_size_threshold``.
+    pack_file_size_threshold : optional, int
+        Maximum size in bytes of a single packed blob sidecar (``.pack``) file.
+        Once a sidecar reaches this size a new one is started.
+    """
+    _validate_threshold("inline_size_threshold", inline_size_threshold, allow_zero=True)
+    _validate_threshold(
+        "dedicated_size_threshold", dedicated_size_threshold, allow_zero=False
+    )
+    _validate_threshold(
+        "pack_file_size_threshold", pack_file_size_threshold, allow_zero=False
+    )
+
+    field = pa.field(name, BlobType(), nullable=nullable)
+    if (
+        inline_size_threshold is None
+        and dedicated_size_threshold is None
+        and pack_file_size_threshold is None
+    ):
+        return field
+
+    metadata = dict(field.metadata or {})
+    if inline_size_threshold is not None:
+        metadata[_BLOB_INLINE_SIZE_THRESHOLD_META_KEY] = str(
+            inline_size_threshold
+        ).encode()
+    if dedicated_size_threshold is not None:
+        metadata[_BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY] = str(
+            dedicated_size_threshold
+        ).encode()
+    if pack_file_size_threshold is not None:
+        metadata[_BLOB_PACK_FILE_SIZE_THRESHOLD_META_KEY] = str(
+            pack_file_size_threshold
+        ).encode()
+    return field.with_metadata(metadata)
 
 
 class BlobIterator:
@@ -210,9 +362,11 @@ class BlobColumn:
     file-like objects.
 
     This can be useful for working with medium-to-small binary objects that need
-    to interface with APIs that expect file-like objects.  For very large binary
-    objects (4-8MB or more per value) you might be better off creating a blob column
-    and using :py:meth:`lance.Dataset.take_blobs` to access the blob data.
+    to interface with APIs that expect file-like objects. For very large binary
+    objects (4-8MB or more per value) you might be better off creating a blob
+    column. Use :py:meth:`lance.Dataset.read_blobs` when you need complete blob
+    bytes, or :py:meth:`lance.Dataset.take_blobs` when you need lazy file-like
+    access.
     """
 
     def __init__(self, blob_column: Union[pa.Array, pa.ChunkedArray]):
@@ -233,18 +387,141 @@ class BlobColumn:
         return BlobIterator(iter(self.blob_column))
 
 
-class BlobFile(io.RawIOBase):
-    """Represents a blob in a Lance dataset as a file-like object."""
+class BlobFile(io.BufferedIOBase):
+    """Represents a blob in a Lance dataset as a file-like object.
+
+    ``read_range`` and ``read_ranges`` do not use the sequential buffer and
+    do not change the sequential cursor.
+
+    Obtain a handle from :py:meth:`lance.dataset.Dataset.take_blobs`.
+    """
+
+    def __init__(
+        self,
+        inner: LanceBlobFile,
+        buffer_size: int = DEFAULT_BLOB_BUFFER_SIZE,
+    ):
+        super().__init__()
+        self.inner = inner
+        self.inner.set_buffer_size(_validate_buffer_size(buffer_size))
+        self._raw = _RawBlobFile(inner)
+
+    def close(self) -> None:
+        self._raw.close()
+
+    @property
+    def closed(self) -> bool:
+        return self._raw.closed
+
+    def readable(self) -> bool:
+        return True
+
+    def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
+        return self._raw.seek(offset, whence)
+
+    def seekable(self) -> bool:
+        return True
+
+    def tell(self) -> int:
+        return self._raw.tell()
+
+    def size(self) -> int:
+        """
+        Returns the size of the blob in bytes.
+        """
+        return self._raw.size()
+
+    def read(self, size: int = -1) -> bytes:
+        if self.closed:
+            raise ValueError("read of closed file")
+        if size is None or size < 0:
+            return self._raw.readall()
+        if size == 0:
+            return b""
+        buf = bytearray(size)
+        n = self.readinto(buf)
+        if n == size:
+            return bytes(buf)
+        return bytes(buf[:n])
+
+    def read1(self, size: int = -1) -> bytes:
+        if self.closed:
+            raise ValueError("read of closed file")
+        if size is None or size < 0:
+            size = io.DEFAULT_BUFFER_SIZE
+        return self._raw.read(size)
+
+    def readall(self) -> bytes:
+        if self.closed:
+            raise ValueError("read of closed file")
+        return self._raw.readall()
+
+    def readinto(self, b) -> int:
+        if isinstance(b, bytearray):
+            if self.closed:
+                raise ValueError("readinto of closed file")
+            if not b:
+                return 0
+            n = self._raw.readinto(b)
+            if n == 0 or n == len(b):
+                return n
+            return n + self._refill_readinto(memoryview(b)[n:])
+
+        view = memoryview(b).cast("B")
+        if view.readonly:
+            raise TypeError(
+                "readinto() argument must be read-write bytes-like object, "
+                f"not {type(b).__name__}"
+            )
+        if self.closed:
+            raise ValueError("readinto of closed file")
+        return self._refill_readinto(view)
+
+    def read_range(self, offset: int, length: int) -> bytes:
+        """Read a blob-local byte range without changing the current cursor."""
+        return self._raw.read_range(offset, length)
+
+    def read_ranges(self, ranges: list[tuple[int, int]]) -> list[bytes]:
+        """
+        Read multiple blob-local byte ranges without changing the current cursor.
+
+        Each range is an ``(offset, length)`` pair, matching
+        :py:meth:`read_range`. The underlying physical reads may be reordered,
+        coalesced, or split for efficiency. For every range, offset plus length
+        must fit in an unsigned 64-bit integer and must not extend beyond the
+        blob size.
+
+        Parameters
+        ----------
+        ranges : List[Tuple[int, int]]
+            The ``(offset, length)`` byte ranges to read.
+
+        Returns
+        -------
+        data : List[bytes]
+            One payload per requested range, in input order.
+        """
+        return self._raw.read_ranges(ranges)
+
+    def __repr__(self) -> str:
+        return f"<BlobFile size={self.size()}>"
+
+    def _refill_readinto(self, view) -> int:
+        filled = 0
+        while filled < len(view):
+            n = self._raw.readinto(view[filled:])
+            if n == 0:
+                break
+            filled += n
+        return filled
+
+
+class _RawBlobFile(io.RawIOBase):
+    """One inner ``read_up_to`` per ``read`` / ``readinto``."""
 
     def __init__(self, inner: LanceBlobFile):
-        """
-        Internal only:  To obtain a BlobFile use
-        :py:meth:`lance.dataset.Dataset.take_blobs`.
-        """
         self.inner = inner
 
-    ## Note: most methods undocumented since they are defined by
-    ## the base class.
     def close(self) -> None:
         self.inner.close()
 
@@ -257,14 +534,16 @@ class BlobFile(io.RawIOBase):
 
     def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
         if whence == io.SEEK_SET:
-            self.inner.seek(offset)
+            position = offset
         elif whence == io.SEEK_CUR:
-            self.inner.seek(self.inner.tell() + offset)
+            position = self.inner.tell() + offset
         elif whence == io.SEEK_END:
-            self.inner.seek(self.inner.size() + offset)
+            position = self.inner.size() + offset
         else:
             raise ValueError(f"Invalid whence: {whence}")
-
+        if position < 0:
+            raise ValueError(f"negative seek value {position}")
+        self.inner.seek(position)
         return self.inner.tell()
 
     def seekable(self) -> bool:
@@ -274,16 +553,31 @@ class BlobFile(io.RawIOBase):
         return self.inner.tell()
 
     def size(self) -> int:
-        """
-        Returns the size of the blob in bytes.
-        """
         return self.inner.size()
 
     def readall(self) -> bytes:
         return self.inner.readall()
 
-    def readinto(self, b: bytearray) -> int:
-        return self.inner.read_into(b)
+    def read_range(self, offset: int, length: int) -> bytes:
+        return self.inner.read_range(offset, length)
 
-    def __repr__(self) -> str:
-        return f"<BlobFile size={self.size()}>"
+    def read_ranges(self, ranges: list[tuple[int, int]]) -> list[bytes]:
+        return self.inner.read_ranges(ranges)
+
+    def readinto(self, b) -> int:
+        # The Rust binding requires bytearray.
+        if isinstance(b, bytearray):
+            return self.inner.read_into(b)
+        view = memoryview(b).cast("B")
+        buffer = bytearray(len(view))
+        bytes_read = self.inner.read_into(buffer)
+        view[:bytes_read] = buffer[:bytes_read]
+        return bytes_read
+
+
+def _validate_buffer_size(buffer_size: int) -> int:
+    if isinstance(buffer_size, bool) or not isinstance(buffer_size, int):
+        raise TypeError(f"buffer_size must be an int, got {type(buffer_size).__name__}")
+    if buffer_size < 0:
+        raise ValueError("buffer_size must be non-negative")
+    return buffer_size

@@ -3,11 +3,16 @@
 
 //! REST implementation of Lance Namespace
 
+mod tls;
+
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::OpsMetrics;
+use crate::merge_insert_on_columns;
+use tls::{ReloadableClient, TlsConfig};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -18,33 +23,39 @@ use crate::context::{DynamicContextProvider, OperationInfo};
 use lance_namespace::apis::urlencode;
 use lance_namespace::models::{
     AlterTableAddColumnsRequest, AlterTableAddColumnsResponse, AlterTableAlterColumnsRequest,
-    AlterTableAlterColumnsResponse, AlterTableDropColumnsRequest, AlterTableDropColumnsResponse,
+    AlterTableAlterColumnsResponse, AlterTableBackfillColumnsRequest,
+    AlterTableBackfillColumnsResponse, AlterTableDropColumnsRequest, AlterTableDropColumnsResponse,
     AlterTransactionRequest, AlterTransactionResponse, AnalyzeTableQueryPlanRequest,
     BatchDeleteTableVersionsRequest, BatchDeleteTableVersionsResponse, CountTableRowsRequest,
-    CreateNamespaceRequest, CreateNamespaceResponse, CreateTableIndexRequest,
-    CreateTableIndexResponse, CreateTableRequest, CreateTableResponse,
+    CreateMaterializedViewRequest, CreateMaterializedViewResponse, CreateNamespaceRequest,
+    CreateNamespaceResponse, CreateTableBranchRequest, CreateTableBranchResponse,
+    CreateTableIndexRequest, CreateTableIndexResponse, CreateTableRequest, CreateTableResponse,
     CreateTableScalarIndexResponse, CreateTableTagRequest, CreateTableTagResponse,
     CreateTableVersionRequest, CreateTableVersionResponse, DeclareTableRequest,
-    DeclareTableResponse, DeleteFromTableRequest, DeleteFromTableResponse, DeleteTableTagRequest,
+    DeclareTableResponse, DeleteFromTableRequest, DeleteFromTableResponse,
+    DeleteTableBranchRequest, DeleteTableBranchResponse, DeleteTableTagRequest,
     DeleteTableTagResponse, DeregisterTableRequest, DeregisterTableResponse,
     DescribeNamespaceRequest, DescribeNamespaceResponse, DescribeTableIndexStatsRequest,
     DescribeTableIndexStatsResponse, DescribeTableRequest, DescribeTableResponse,
     DescribeTableVersionRequest, DescribeTableVersionResponse, DescribeTransactionRequest,
     DescribeTransactionResponse, DropNamespaceRequest, DropNamespaceResponse,
     DropTableIndexRequest, DropTableIndexResponse, DropTableRequest, DropTableResponse,
-    ExplainTableQueryPlanRequest, GetTableStatsRequest, GetTableStatsResponse,
+    ErrorResponse, ExplainTableQueryPlanRequest, GetTableStatsRequest, GetTableStatsResponse,
     GetTableTagVersionRequest, GetTableTagVersionResponse, InsertIntoTableRequest,
     InsertIntoTableResponse, ListNamespacesRequest, ListNamespacesResponse,
-    ListTableIndicesRequest, ListTableIndicesResponse, ListTableTagsRequest, ListTableTagsResponse,
+    ListTableBranchesRequest, ListTableBranchesResponse, ListTableIndicesRequest,
+    ListTableIndicesResponse, ListTableTagsRequest, ListTableTagsResponse,
     ListTableVersionsRequest, ListTableVersionsResponse, ListTablesRequest, ListTablesResponse,
     MergeInsertIntoTableRequest, MergeInsertIntoTableResponse, NamespaceExistsRequest,
-    QueryTableRequest, RegisterTableRequest, RegisterTableResponse, RenameTableRequest,
-    RenameTableResponse, RestoreTableRequest, RestoreTableResponse, TableExistsRequest,
-    UpdateTableRequest, UpdateTableResponse, UpdateTableSchemaMetadataRequest,
-    UpdateTableSchemaMetadataResponse, UpdateTableTagRequest, UpdateTableTagResponse,
+    QueryTableRequest, RefreshMaterializedViewRequest, RefreshMaterializedViewResponse,
+    RegisterTableRequest, RegisterTableResponse, RenameTableRequest, RenameTableResponse,
+    RestoreTableRequest, RestoreTableResponse, TableExistsRequest, UpdateTableRequest,
+    UpdateTableResponse, UpdateTableSchemaMetadataRequest, UpdateTableSchemaMetadataResponse,
+    UpdateTableTagRequest, UpdateTableTagResponse,
 };
 use serde::{Serialize, de::DeserializeOwned};
 
+use lance_core::utils::parse::str_to_bool;
 use lance_core::{Error, Result};
 
 use lance_namespace::LanceNamespace;
@@ -52,15 +63,18 @@ use lance_namespace::error::NamespaceError;
 
 /// HTTP client wrapper that supports per-request header injection.
 ///
-/// This client wraps a single `reqwest::Client` and applies dynamic headers
-/// to each request without recreating the client. This is more efficient than
-/// creating a new client per request when using a `DynamicContextProvider`.
+/// This client applies dynamic headers to each request without recreating the
+/// client. This is more efficient than creating a new client per request when
+/// using a `DynamicContextProvider`.
 ///
 /// The design follows lancedb's `RestfulLanceDbClient` pattern where headers
 /// are applied to the built request using `headers_mut()` before execution.
+///
+/// The underlying `reqwest::Client` is only recreated when the TLS material it
+/// presents is rotated on disk, see [`ReloadableClient`].
 #[derive(Clone)]
 struct RestClient {
-    client: reqwest::Client,
+    client: Arc<ReloadableClient>,
     base_path: String,
     base_headers: HashMap<String, String>,
     context_provider: Option<Arc<dyn DynamicContextProvider>>,
@@ -126,7 +140,7 @@ impl RestClient {
     ) -> std::result::Result<reqwest::Response, reqwest::Error> {
         let mut request = req_builder.build()?;
         self.apply_headers(&mut request, operation, object_id);
-        self.client.execute(request).await
+        self.client().execute(request).await
     }
 
     /// Get the base path URL
@@ -134,9 +148,12 @@ impl RestClient {
         &self.base_path
     }
 
-    /// Get a reference to the underlying reqwest client
-    fn client(&self) -> &reqwest::Client {
-        &self.client
+    /// Get the reqwest client to use for the next request.
+    ///
+    /// Returned by value because the client is replaced when the TLS material it presents
+    /// is rotated on disk. Cloning it is cheap: `reqwest::Client` is a handle around an `Arc`.
+    fn client(&self) -> reqwest::Client {
+        self.client.current()
     }
 }
 
@@ -167,6 +184,8 @@ pub struct RestNamespaceBuilder {
     key_file: Option<String>,
     ssl_ca_cert: Option<String>,
     assert_hostname: bool,
+    /// How often the TLS files are checked for rotation, in seconds. 0 disables reloading.
+    reload_interval_seconds: u64,
     context_provider: Option<Arc<dyn DynamicContextProvider>>,
     /// When true, tracks operation metrics. Default: false.
     ops_metrics_enabled: bool,
@@ -182,6 +201,7 @@ impl std::fmt::Debug for RestNamespaceBuilder {
             .field("key_file", &self.key_file)
             .field("ssl_ca_cert", &self.ssl_ca_cert)
             .field("assert_hostname", &self.assert_hostname)
+            .field("reload_interval_seconds", &self.reload_interval_seconds)
             .field(
                 "context_provider",
                 &self.context_provider.as_ref().map(|_| "Some(...)"),
@@ -194,6 +214,12 @@ impl std::fmt::Debug for RestNamespaceBuilder {
 impl RestNamespaceBuilder {
     /// Default delimiter for object identifiers
     const DEFAULT_DELIMITER: &'static str = "$";
+
+    /// Default interval between two checks for rotated TLS material, in seconds.
+    ///
+    /// Certificate agents typically re-mint short-lived certificates hours before they expire,
+    /// so a few minutes of staleness is harmless while keeping the cost of the check negligible.
+    const DEFAULT_RELOAD_INTERVAL_SECONDS: u64 = 300;
 
     /// Create a new RestNamespaceBuilder with the specified URI.
     ///
@@ -209,6 +235,7 @@ impl RestNamespaceBuilder {
             key_file: None,
             ssl_ca_cert: None,
             assert_hostname: true,
+            reload_interval_seconds: Self::DEFAULT_RELOAD_INTERVAL_SECONDS,
             context_provider: None,
             ops_metrics_enabled: false,
         }
@@ -225,6 +252,8 @@ impl RestNamespaceBuilder {
     /// - `tls.key_file`: Path to client private key file (optional)
     /// - `tls.ssl_ca_cert`: Path to CA certificate file (optional)
     /// - `tls.assert_hostname`: Whether to verify hostname (optional, defaults to true)
+    /// - `tls.reload_interval_seconds`: How often the TLS files above are checked for rotation
+    ///   (optional, defaults to 300, `0` disables reloading)
     ///
     /// # Arguments
     ///
@@ -285,13 +314,24 @@ impl RestNamespaceBuilder {
         let ssl_ca_cert = properties.get("tls.ssl_ca_cert").cloned();
         let assert_hostname = properties
             .get("tls.assert_hostname")
-            .and_then(|v| v.parse::<bool>().ok())
+            .and_then(|v| str_to_bool(v))
             .unwrap_or(true);
+        let reload_interval_seconds = match properties.get("tls.reload_interval_seconds") {
+            Some(value) => value.parse::<u64>().map_err(|e| {
+                lance_core::Error::from(NamespaceError::InvalidInput {
+                    message: format!(
+                        "Invalid value '{value}' for property 'tls.reload_interval_seconds', \
+                         expected a number of seconds: {e}"
+                    ),
+                })
+            })?,
+            None => Self::DEFAULT_RELOAD_INTERVAL_SECONDS,
+        };
 
         // Extract ops_metrics_enabled (default: false)
         let ops_metrics_enabled = properties
             .get("ops_metrics_enabled")
-            .and_then(|v| v.parse::<bool>().ok())
+            .and_then(|v| str_to_bool(v))
             .unwrap_or(false);
 
         Ok(Self {
@@ -302,6 +342,7 @@ impl RestNamespaceBuilder {
             key_file,
             ssl_ca_cert,
             assert_hostname,
+            reload_interval_seconds,
             context_provider: None,
             ops_metrics_enabled,
         })
@@ -375,6 +416,23 @@ impl RestNamespaceBuilder {
     /// * `assert_hostname` - Whether to verify hostname
     pub fn assert_hostname(mut self, assert_hostname: bool) -> Self {
         self.assert_hostname = assert_hostname;
+        self
+    }
+
+    /// Set how often the TLS files are checked for rotation.
+    ///
+    /// Client certificates are commonly short-lived and re-minted onto the same paths while the
+    /// process runs. Once the interval has elapsed, the next request re-reads the configured
+    /// certificate, key and CA files, and rebuilds the HTTP client if their content changed.
+    /// Unchanged content leaves the client, and therefore its connection pool, untouched.
+    ///
+    /// Defaults to 300 seconds.
+    ///
+    /// # Arguments
+    ///
+    /// * `reload_interval_seconds` - Interval between checks in seconds, `0` to never reload
+    pub fn reload_interval_seconds(mut self, reload_interval_seconds: u64) -> Self {
+        self.reload_interval_seconds = reload_interval_seconds;
         self
     }
 
@@ -487,35 +545,18 @@ impl std::fmt::Display for RestNamespace {
 impl RestNamespace {
     /// Create a new REST namespace from builder
     pub(crate) fn from_builder(builder: RestNamespaceBuilder) -> Self {
-        // Build reqwest client WITHOUT default headers - we'll apply headers per-request
-        let mut client_builder = reqwest::Client::builder();
-
-        // Configure mTLS if certificate and key files are provided
-        if let (Some(cert_file), Some(key_file)) = (&builder.cert_file, &builder.key_file)
-            && let (Ok(cert), Ok(key)) = (std::fs::read(cert_file), std::fs::read(key_file))
-            && let Ok(identity) = reqwest::Identity::from_pem(&[&cert[..], &key[..]].concat())
-        {
-            client_builder = client_builder.identity(identity);
-        }
-
-        // Load CA certificate for server verification
-        if let Some(ca_cert_file) = &builder.ssl_ca_cert
-            && let Ok(ca_cert) = std::fs::read(ca_cert_file)
-            && let Ok(ca_cert) = reqwest::Certificate::from_pem(&ca_cert)
-        {
-            client_builder = client_builder.add_root_certificate(ca_cert);
-        }
-
-        // Configure hostname verification
-        client_builder = client_builder.danger_accept_invalid_hostnames(!builder.assert_hostname);
-
-        let client = client_builder
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+        let tls = TlsConfig {
+            cert_file: builder.cert_file,
+            key_file: builder.key_file,
+            ssl_ca_cert: builder.ssl_ca_cert,
+            assert_hostname: builder.assert_hostname,
+        };
+        let reload_interval = (builder.reload_interval_seconds > 0)
+            .then(|| Duration::from_secs(builder.reload_interval_seconds));
 
         // Create the RestClient that handles per-request header injection
         let rest_client = RestClient {
-            client,
+            client: Arc::new(ReloadableClient::new(tls, reload_interval)),
             base_path: builder.uri,
             base_headers: builder.headers,
             context_provider: builder.context_provider,
@@ -534,93 +575,38 @@ impl RestNamespace {
         }
     }
 
+    /// Map a reqwest::Error to the appropriate NamespaceError variant.
+    ///
+    /// Timeout and connection errors are mapped to `ServiceUnavailable`,
+    /// while other errors are mapped to `Internal`.
+    fn request_error(e: reqwest::Error) -> lance_core::Error {
+        let message = format!("Failed to execute request: {:?}", e);
+        if e.is_timeout() || e.is_connect() {
+            NamespaceError::ServiceUnavailable { message }.into()
+        } else {
+            NamespaceError::Internal { message }.into()
+        }
+    }
+
     /// Parse an error response body and return the appropriate NamespaceError.
     ///
-    /// Attempts to parse a JSON body with `{"error": {"code": N, "message": "..."}}`.
-    /// Falls back to mapping the HTTP status code (using the operation to disambiguate)
-    /// if the JSON body doesn't contain an error code.
-    fn parse_error_response(
-        status: reqwest::StatusCode,
-        content: &str,
-        operation: &str,
-    ) -> lance_core::Error {
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(content)
-            && let Some(error_obj) = json.get("error")
-        {
-            let code = error_obj
-                .get("code")
-                .and_then(|c| c.as_u64())
-                .map(|c| c as u32);
-            let message = error_obj
-                .get("message")
-                .and_then(|m| m.as_str())
-                .unwrap_or(content);
-
-            if let Some(code) = code {
-                return NamespaceError::from_code(code, message).into();
+    /// Deserializes the response as an `ErrorResponse` model (the spec-defined
+    /// flat JSON format with a required numeric `code` field). The error code is
+    /// the sole source of truth for error classification. When deserialization
+    /// fails, returns Internal with the raw response as context.
+    fn parse_error_response(status: reqwest::StatusCode, content: &str) -> lance_core::Error {
+        match serde_json::from_str::<ErrorResponse>(content) {
+            Ok(err_resp) => {
+                let message = err_resp.error.as_deref().unwrap_or(content);
+                NamespaceError::from_code(err_resp.code as u32, message).into()
             }
-        }
-
-        let message = format!("Response error: status={}, content={}", status, content);
-        Self::error_from_status(status, operation, message).into()
-    }
-
-    /// Map an HTTP status code to a NamespaceError variant.
-    ///
-    /// For unambiguous status codes (401, 403, 429, 501, 503) the mapping is direct.
-    /// For 404 and 409 the `operation` string is used to select the appropriate
-    /// "not found" or "already exists" variant.
-    fn error_from_status(
-        status: reqwest::StatusCode,
-        operation: &str,
-        message: String,
-    ) -> NamespaceError {
-        match status.as_u16() {
-            400 => NamespaceError::InvalidInput { message },
-            401 => NamespaceError::Unauthenticated { message },
-            403 => NamespaceError::PermissionDenied { message },
-            404 => Self::not_found_for_operation(operation, message),
-            409 => Self::already_exists_for_operation(operation, message),
-            429 => NamespaceError::Throttled { message },
-            501 => NamespaceError::Unsupported { message },
-            503 => NamespaceError::ServiceUnavailable { message },
-            _ => NamespaceError::Internal { message },
-        }
-    }
-
-    /// Pick the appropriate "not found" variant based on the operation.
-    fn not_found_for_operation(operation: &str, message: String) -> NamespaceError {
-        if operation.contains("namespace") {
-            NamespaceError::NamespaceNotFound { message }
-        } else if operation.contains("index") {
-            NamespaceError::TableIndexNotFound { message }
-        } else if operation.contains("tag") {
-            NamespaceError::TableTagNotFound { message }
-        } else if operation.contains("transaction") {
-            NamespaceError::TransactionNotFound { message }
-        } else if operation.contains("version") {
-            NamespaceError::TableVersionNotFound { message }
-        } else if operation.contains("column") {
-            NamespaceError::TableColumnNotFound { message }
-        } else if operation.contains("table") {
-            NamespaceError::TableNotFound { message }
-        } else {
-            NamespaceError::Internal { message }
-        }
-    }
-
-    /// Pick the appropriate "already exists" variant based on the operation.
-    fn already_exists_for_operation(operation: &str, message: String) -> NamespaceError {
-        if operation.contains("namespace") {
-            NamespaceError::NamespaceAlreadyExists { message }
-        } else if operation.contains("index") {
-            NamespaceError::TableIndexAlreadyExists { message }
-        } else if operation.contains("tag") {
-            NamespaceError::TableTagAlreadyExists { message }
-        } else if operation.contains("table") {
-            NamespaceError::TableAlreadyExists { message }
-        } else {
-            NamespaceError::Internal { message }
+            Err(e) => NamespaceError::Internal {
+                message: format!(
+                    "Failed to parse error response: status={}, body={}, error={:?}",
+                    status, content, e
+                ),
+            }
+            .into(),
         }
     }
 
@@ -639,28 +625,24 @@ impl RestNamespace {
             .rest_client
             .execute(req_builder, operation, object_id)
             .await
-            .map_err(|e| {
-                Error::from(NamespaceError::Internal {
-                    message: format!("Failed to execute request: {}", e),
-                })
-            })?;
+            .map_err(Self::request_error)?;
 
         let status = resp.status();
         let content = resp.text().await.map_err(|e| {
             Error::from(NamespaceError::Internal {
-                message: format!("Failed to read response body: {}", e),
+                message: format!("Failed to read response body: {:?}", e),
             })
         })?;
 
         if status.is_success() {
             serde_json::from_str(&content).map_err(|e| {
                 NamespaceError::Internal {
-                    message: format!("Failed to parse response: {}", e),
+                    message: format!("Failed to parse response: {:?}", e),
                 }
                 .into()
             })
         } else {
-            Err(Self::parse_error_response(status, &content, operation))
+            Err(Self::parse_error_response(status, &content))
         }
     }
 
@@ -680,28 +662,24 @@ impl RestNamespace {
             .rest_client
             .execute(req_builder, operation, object_id)
             .await
-            .map_err(|e| {
-                Error::from(NamespaceError::Internal {
-                    message: format!("Failed to execute request: {}", e),
-                })
-            })?;
+            .map_err(Self::request_error)?;
 
         let status = resp.status();
         let content = resp.text().await.map_err(|e| {
             Error::from(NamespaceError::Internal {
-                message: format!("Failed to read response body: {}", e),
+                message: format!("Failed to read response body: {:?}", e),
             })
         })?;
 
         if status.is_success() {
             serde_json::from_str(&content).map_err(|e| {
                 NamespaceError::Internal {
-                    message: format!("Failed to parse response: {}", e),
+                    message: format!("Failed to parse response: {:?}", e),
                 }
                 .into()
             })
         } else {
-            Err(Self::parse_error_response(status, &content, operation))
+            Err(Self::parse_error_response(status, &content))
         }
     }
 
@@ -721,11 +699,7 @@ impl RestNamespace {
             .rest_client
             .execute(req_builder, operation, object_id)
             .await
-            .map_err(|e| {
-                Error::from(NamespaceError::Internal {
-                    message: format!("Failed to execute request: {}", e),
-                })
-            })?;
+            .map_err(Self::request_error)?;
 
         let status = resp.status();
         if status.is_success() {
@@ -733,10 +707,10 @@ impl RestNamespace {
         } else {
             let content = resp.text().await.map_err(|e| {
                 Error::from(NamespaceError::Internal {
-                    message: format!("Failed to read response body: {}", e),
+                    message: format!("Failed to read response body: {:?}", e),
                 })
             })?;
-            Err(Self::parse_error_response(status, &content, operation))
+            Err(Self::parse_error_response(status, &content))
         }
     }
 
@@ -756,28 +730,24 @@ impl RestNamespace {
             .rest_client
             .execute(req_builder, operation, object_id)
             .await
-            .map_err(|e| {
-                Error::from(NamespaceError::Internal {
-                    message: format!("Failed to execute request: {}", e),
-                })
-            })?;
+            .map_err(Self::request_error)?;
 
         let status = resp.status();
         let content = resp.text().await.map_err(|e| {
             Error::from(NamespaceError::Internal {
-                message: format!("Failed to read response body: {}", e),
+                message: format!("Failed to read response body: {:?}", e),
             })
         })?;
 
         if status.is_success() {
             serde_json::from_str(&content).map_err(|e| {
                 NamespaceError::Internal {
-                    message: format!("Failed to parse response: {}", e),
+                    message: format!("Failed to parse response: {:?}", e),
                 }
                 .into()
             })
         } else {
-            Err(Self::parse_error_response(status, &content, operation))
+            Err(Self::parse_error_response(status, &content))
         }
     }
 
@@ -902,6 +872,11 @@ impl LanceNamespace for RestNamespace {
             limit_str = limit.to_string();
             query.push(("limit", limit_str.as_str()));
         }
+        let include_declared_str;
+        if let Some(include_declared) = request.include_declared {
+            include_declared_str = include_declared.to_string();
+            query.push(("include_declared", include_declared_str.as_str()));
+        }
         self.get_json(&path, &query, "list_tables", &id).await
     }
 
@@ -920,6 +895,11 @@ impl LanceNamespace for RestNamespace {
         if let Some(detailed) = request.load_detailed_metadata {
             detailed_str = detailed.to_string();
             query.push(("load_detailed_metadata", detailed_str.as_str()));
+        }
+        let check_declared_str;
+        if let Some(check_declared) = request.check_declared {
+            check_declared_str = check_declared.to_string();
+            query.push(("check_declared", check_declared_str.as_str()));
         }
         self.post_json(&path, &query, &request, "describe_table", &id)
             .await
@@ -992,6 +972,32 @@ impl LanceNamespace for RestNamespace {
             mode_str = mode.clone();
             query.push(("mode", mode_str.as_str()));
         }
+        // The REST spec maps create_table metadata onto query parameters because the request body
+        // is already reserved for the Arrow IPC stream.
+        let properties_str;
+        if let Some(ref properties) = request.properties {
+            properties_str = serde_json::to_string(properties).map_err(|e| {
+                Error::from(NamespaceError::InvalidInput {
+                    message: format!(
+                        "Failed to serialize create_table properties as JSON query parameter: {}",
+                        e
+                    ),
+                })
+            })?;
+            query.push(("properties", properties_str.as_str()));
+        }
+        let storage_options_str;
+        if let Some(ref storage_options) = request.storage_options {
+            storage_options_str = serde_json::to_string(storage_options).map_err(|e| {
+                Error::from(NamespaceError::InvalidInput {
+                    message: format!(
+                        "Failed to serialize create_table storage_options as JSON query parameter: {}",
+                        e
+                    ),
+                })
+            })?;
+            query.push(("storage_options", storage_options_str.as_str()));
+        }
         self.post_binary_json(&path, &query, request_data.to_vec(), "create_table", &id)
             .await
     }
@@ -1040,14 +1046,13 @@ impl LanceNamespace for RestNamespace {
         let id = object_id_str(&request.id, &self.delimiter)?;
         let encoded_id = urlencode(&id);
 
-        let on = request.on.as_deref().ok_or_else(|| {
-            lance_core::Error::from(NamespaceError::InvalidInput {
-                message: "'on' field is required for merge insert".to_string(),
-            })
-        })?;
+        let on = merge_insert_on_columns(request.on.as_deref(), "merge_insert_into_table")?;
 
         let path = format!("/v1/table/{}/merge_insert", encoded_id);
-        let mut query = vec![("delimiter", self.delimiter.as_str()), ("on", on)];
+        // The `on` query parameter uses `style: form, explode: true`, so a composite key
+        // repeats the parameter once per column.
+        let mut query = vec![("delimiter", self.delimiter.as_str())];
+        query.extend(on.iter().map(|column| ("on", column.as_str())));
 
         let when_matched_update_all_str;
         if let Some(v) = request.when_matched_update_all {
@@ -1141,26 +1146,22 @@ impl LanceNamespace for RestNamespace {
             .rest_client
             .execute(req_builder, operation, &id)
             .await
-            .map_err(|e| {
-                Error::from(NamespaceError::Internal {
-                    message: format!("Failed to execute request: {}", e),
-                })
-            })?;
+            .map_err(Self::request_error)?;
 
         let status = resp.status();
         if status.is_success() {
             resp.bytes().await.map_err(|e| {
                 Error::from(NamespaceError::Internal {
-                    message: format!("Failed to read response bytes: {}", e),
+                    message: format!("Failed to read response bytes: {:?}", e),
                 })
             })
         } else {
             let content = resp.text().await.map_err(|e| {
                 Error::from(NamespaceError::Internal {
-                    message: format!("Failed to read response body: {}", e),
+                    message: format!("Failed to read response body: {:?}", e),
                 })
             })?;
-            Err(Self::parse_error_response(status, &content, operation))
+            Err(Self::parse_error_response(status, &content))
         }
     }
 
@@ -1279,6 +1280,11 @@ impl LanceNamespace for RestNamespace {
             limit_str = limit.to_string();
             query.push(("limit", limit_str.as_str()));
         }
+        let include_declared_str;
+        if let Some(include_declared) = request.include_declared {
+            include_declared_str = include_declared.to_string();
+            query.push(("include_declared", include_declared_str.as_str()));
+        }
         self.get_json(path, &query, "list_all_tables", "").await
     }
 
@@ -1325,6 +1331,13 @@ impl LanceNamespace for RestNamespace {
         if let Some(descending) = request.descending {
             descending_str = descending.to_string();
             query.push(("descending", descending_str.as_str()));
+        }
+        // Forward branch as a query param (this op sends no body).
+        // describe_table_version differs: branch rides its body, already serialized.
+        let branch_str;
+        if let Some(ref branch) = request.branch {
+            branch_str = branch.clone();
+            query.push(("branch", branch_str.as_str()));
         }
         self.post_json(&path, &query, &(), "list_table_versions", &id)
             .await
@@ -1472,6 +1485,45 @@ impl LanceNamespace for RestNamespace {
             .await
     }
 
+    async fn alter_table_backfill_columns(
+        &self,
+        request: AlterTableBackfillColumnsRequest,
+    ) -> Result<AlterTableBackfillColumnsResponse> {
+        self.record_op("alter_table_backfill_columns");
+        let id = object_id_str(&request.id, &self.delimiter)?;
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/table/{}/backfill_column", encoded_id);
+        let query = [("delimiter", self.delimiter.as_str())];
+        self.post_json(&path, &query, &request, "alter_table_backfill_columns", &id)
+            .await
+    }
+
+    async fn refresh_materialized_view(
+        &self,
+        request: RefreshMaterializedViewRequest,
+    ) -> Result<RefreshMaterializedViewResponse> {
+        self.record_op("refresh_materialized_view");
+        let id = object_id_str(&request.id, &self.delimiter)?;
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/materialized_view/{}/refresh", encoded_id);
+        let query = [("delimiter", self.delimiter.as_str())];
+        self.post_json(&path, &query, &request, "refresh_materialized_view", &id)
+            .await
+    }
+
+    async fn create_materialized_view(
+        &self,
+        request: CreateMaterializedViewRequest,
+    ) -> Result<CreateMaterializedViewResponse> {
+        self.record_op("create_materialized_view");
+        let id = object_id_str(&request.id, &self.delimiter)?;
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/materialized_view/{}/create", encoded_id);
+        let query = [("delimiter", self.delimiter.as_str())];
+        self.post_json(&path, &query, &request, "create_materialized_view", &id)
+            .await
+    }
+
     async fn list_table_tags(
         &self,
         request: ListTableTagsRequest,
@@ -1543,6 +1595,55 @@ impl LanceNamespace for RestNamespace {
         let path = format!("/v1/table/{}/tags/update", encoded_id);
         let query = [("delimiter", self.delimiter.as_str())];
         self.post_json(&path, &query, &request, "update_table_tag", &id)
+            .await
+    }
+
+    async fn create_table_branch(
+        &self,
+        request: CreateTableBranchRequest,
+    ) -> Result<CreateTableBranchResponse> {
+        self.record_op("create_table_branch");
+        let id = object_id_str(&request.id, &self.delimiter)?;
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/table/{}/branches/create", encoded_id);
+        let query = [("delimiter", self.delimiter.as_str())];
+        self.post_json(&path, &query, &request, "create_table_branch", &id)
+            .await
+    }
+
+    async fn list_table_branches(
+        &self,
+        request: ListTableBranchesRequest,
+    ) -> Result<ListTableBranchesResponse> {
+        self.record_op("list_table_branches");
+        let id = object_id_str(&request.id, &self.delimiter)?;
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/table/{}/branches/list", encoded_id);
+        let mut query = vec![("delimiter", self.delimiter.as_str())];
+        let page_token_str;
+        if let Some(ref pt) = request.page_token {
+            page_token_str = pt.clone();
+            query.push(("page_token", page_token_str.as_str()));
+        }
+        let limit_str;
+        if let Some(limit) = request.limit {
+            limit_str = limit.to_string();
+            query.push(("limit", limit_str.as_str()));
+        }
+        self.post_json(&path, &query, &request, "list_table_branches", &id)
+            .await
+    }
+
+    async fn delete_table_branch(
+        &self,
+        request: DeleteTableBranchRequest,
+    ) -> Result<DeleteTableBranchResponse> {
+        self.record_op("delete_table_branch");
+        let id = object_id_str(&request.id, &self.delimiter)?;
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/table/{}/branches/delete", encoded_id);
+        let query = [("delimiter", self.delimiter.as_str())];
+        self.post_json(&path, &query, &request, "delete_table_branch", &id)
             .await
     }
 
@@ -1681,6 +1782,75 @@ mod tests {
         assert_eq!(builder.key_file, Some("/path/to/key.pem".to_string()));
         assert_eq!(builder.ssl_ca_cert, Some("/path/to/ca.pem".to_string()));
         assert!(builder.assert_hostname);
+        assert_eq!(
+            builder.reload_interval_seconds,
+            RestNamespaceBuilder::DEFAULT_RELOAD_INTERVAL_SECONDS
+        );
+    }
+
+    #[test]
+    fn test_tls_reload_interval_parsing() {
+        let mut properties = HashMap::new();
+        properties.insert("uri".to_string(), "https://api.example.com".to_string());
+        properties.insert("tls.reload_interval_seconds".to_string(), "60".to_string());
+
+        let builder = RestNamespaceBuilder::from_properties(properties)
+            .expect("Failed to create namespace builder");
+        assert_eq!(builder.reload_interval_seconds, 60);
+    }
+
+    #[test]
+    fn test_tls_reload_disabled_by_zero_interval() {
+        let mut properties = HashMap::new();
+        properties.insert("uri".to_string(), "https://api.example.com".to_string());
+        properties.insert("tls.reload_interval_seconds".to_string(), "0".to_string());
+
+        let builder = RestNamespaceBuilder::from_properties(properties)
+            .expect("Failed to create namespace builder");
+        assert_eq!(builder.reload_interval_seconds, 0);
+    }
+
+    #[test]
+    fn test_tls_reload_interval_reaches_the_client() {
+        let namespace = RestNamespaceBuilder::new("https://api.example.com")
+            .cert_file("/path/to/cert.pem")
+            .key_file("/path/to/key.pem")
+            .build();
+        assert_eq!(
+            namespace.rest_client.client.reload_interval(),
+            Some(Duration::from_secs(
+                RestNamespaceBuilder::DEFAULT_RELOAD_INTERVAL_SECONDS
+            ))
+        );
+
+        let namespace = RestNamespaceBuilder::new("https://api.example.com")
+            .cert_file("/path/to/cert.pem")
+            .key_file("/path/to/key.pem")
+            .reload_interval_seconds(0)
+            .build();
+        assert_eq!(
+            namespace.rest_client.client.reload_interval(),
+            None,
+            "an interval of 0 should disable reloading"
+        );
+    }
+
+    #[test]
+    fn test_tls_reload_interval_rejects_invalid_value() {
+        let mut properties = HashMap::new();
+        properties.insert("uri".to_string(), "https://api.example.com".to_string());
+        properties.insert(
+            "tls.reload_interval_seconds".to_string(),
+            "5 minutes".to_string(),
+        );
+
+        let error = RestNamespaceBuilder::from_properties(properties)
+            .expect_err("an unparsable interval should be rejected")
+            .to_string();
+        assert!(
+            error.contains("tls.reload_interval_seconds") && error.contains("5 minutes"),
+            "the error should name the property and its value: {error}"
+        );
     }
 
     #[test]
@@ -1869,6 +2039,75 @@ mod tests {
 
         // Should succeed with mock server
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_create_table_sends_properties_and_storage_options_query_params() {
+        use std::collections::HashMap;
+
+        let mock_server = MockServer::start().await;
+
+        let path_str = "/v1/table/test$namespace$table/create".replace("$", "%24");
+        Mock::given(method("POST"))
+            .and(path(path_str.as_str()))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "location": "/path/to/table",
+                "version": 1,
+                "properties": {
+                    "owner": "alice",
+                    "team": "eng"
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let namespace = RestNamespaceBuilder::new(mock_server.uri()).build();
+
+        let request = CreateTableRequest {
+            id: Some(vec![
+                "test".to_string(),
+                "namespace".to_string(),
+                "table".to_string(),
+            ]),
+            mode: Some("Create".to_string()),
+            properties: Some(HashMap::from([
+                ("owner".to_string(), "alice".to_string()),
+                ("team".to_string(), "eng".to_string()),
+            ])),
+            storage_options: Some(HashMap::from([
+                ("aws_region".to_string(), "us-east-1".to_string()),
+                ("timeout".to_string(), "30s".to_string()),
+            ])),
+            ..Default::default()
+        };
+
+        let result = namespace
+            .create_table(request, Bytes::from("arrow data here"))
+            .await;
+
+        assert!(result.is_ok(), "Failed: {:?}", result.err());
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+
+        let query_params: HashMap<String, String> =
+            request.url.query_pairs().into_owned().collect();
+        assert_eq!(query_params.get("mode"), Some(&"Create".to_string()));
+
+        let properties: serde_json::Value =
+            serde_json::from_str(query_params.get("properties").unwrap()).unwrap();
+        assert_eq!(
+            properties,
+            serde_json::json!({"owner": "alice", "team": "eng"})
+        );
+
+        let storage_options: serde_json::Value =
+            serde_json::from_str(query_params.get("storage_options").unwrap()).unwrap();
+        assert_eq!(
+            storage_options,
+            serde_json::json!({"aws_region": "us-east-1", "timeout": "30s"})
+        );
     }
 
     #[tokio::test]

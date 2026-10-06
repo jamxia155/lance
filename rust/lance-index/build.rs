@@ -6,6 +6,9 @@ use std::io::Result;
 
 fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=protos");
+    // Cache-entry protos are library-internal serialization, not part of the
+    // on-disk format spec, so they live here rather than in the shared `protos/`.
+    println!("cargo:rerun-if-changed=protos-cache");
 
     #[cfg(feature = "protoc")]
     // Use vendored protobuf compiler if requested.
@@ -16,9 +19,15 @@ fn main() -> Result<()> {
     let mut prost_build = prost_build::Config::new();
     prost_build.protoc_arg("--experimental_allow_proto3_optional");
     prost_build.enable_type_names();
+    prost_build.compile_protos(&["./protos/index_old.proto"], &["./protos"])?;
+    // `index.proto` references `lance.table.InvertedIndexDetails`. An extern
+    // path resolves the reference to the module that includes the generated
+    // `lance.table` code, but it also stops prost from generating that
+    // package, hence the separate pass above.
+    prost_build.extern_path(".lance.table", "crate::pbold");
     prost_build.compile_protos(
-        &["./protos/index.proto", "./protos/index_old.proto"],
-        &["./protos"],
+        &["./protos/index.proto", "./protos-cache/cache.proto"],
+        &["./protos", "./protos-cache"],
     )?;
 
     let rust_toolchain = env::var("RUSTUP_TOOLCHAIN")

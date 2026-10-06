@@ -7,14 +7,17 @@ use arrow_array::{
     Float32Array,
     types::{Float16Type, Float32Type, Float64Type},
 };
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use std::hint::black_box;
+
+use criterion::{Criterion, criterion_group, criterion_main};
 use num_traits::{AsPrimitive, Float};
 use rand::Rng;
 
 #[cfg(target_os = "linux")]
-use pprof::criterion::{Output, PProfProfiler};
+use lance_testing::pprof::{Output, PProfProfiler};
 
 use lance_arrow::{ArrowFloatType, FloatArray};
+use lance_linalg::distance::l2_u8::l2_u8;
 use lance_linalg::distance::{L2, l2::l2, l2_distance_batch, l2_distance_uint_scalar};
 use lance_testing::datagen::generate_random_array_with_seed;
 
@@ -106,13 +109,10 @@ fn bench_small_distance(c: &mut Criterion) {
 fn l2_distance_uint_scalar_auto_vectorized(key: &[u8], target: &[u8]) -> f32 {
     let mut sum = 0;
     const LANE: usize = 16;
-    let x_chunks = key.chunks_exact(LANE);
-    let y_chunks = target.chunks_exact(LANE);
+    let (x_chunks, x_reminder) = key.as_chunks::<LANE>();
+    let (y_chunks, y_reminder) = target.as_chunks::<LANE>();
 
-    let x_reminder = x_chunks.remainder();
-    let y_reminder = y_chunks.remainder();
-
-    for (x, y) in x_chunks.zip(y_chunks) {
+    for (x, y) in x_chunks.iter().zip(y_chunks) {
         let mut s: u32 = 0;
         for i in 0..LANE {
             s += (x[i].abs_diff(y[i]) as u32).pow(2);
@@ -140,7 +140,9 @@ fn bench_uint_distance(c: &mut Criterion) {
         b.iter(|| {
             black_box(
                 target
-                    .chunks_exact(DIMENSION)
+                    .as_chunks::<DIMENSION>()
+                    .0
+                    .iter()
                     .map(|tgt| l2_distance_uint_scalar(&key, tgt))
                     .fold(0.0, |acc, v| acc + v),
             );
@@ -151,8 +153,23 @@ fn bench_uint_distance(c: &mut Criterion) {
         b.iter(|| {
             black_box(
                 target
-                    .chunks_exact(DIMENSION)
+                    .as_chunks::<DIMENSION>()
+                    .0
+                    .iter()
                     .map(|tgt| l2_distance_uint_scalar_auto_vectorized(&key, tgt))
+                    .fold(0.0, |acc, v| acc + v),
+            );
+        });
+    });
+
+    c.bench_function("L2(u8, SIMD)", |b| {
+        b.iter(|| {
+            black_box(
+                target
+                    .as_chunks::<DIMENSION>()
+                    .0
+                    .iter()
+                    .map(|tgt| l2_u8(&key, tgt) as f32)
                     .fold(0.0, |acc, v| acc + v),
             );
         });

@@ -18,6 +18,7 @@ import org.lance.namespace.LanceNamespace;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.util.Preconditions;
 
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 
@@ -73,6 +74,8 @@ public class CommitBuilder {
   private String storageFormat;
   private int maxRetries = 0;
   private boolean skipAutoCleanup = false;
+  // -1 disables the timeout; any positive value is the timeout in nanoseconds.
+  private long commitTimeoutNanos = Duration.ofMinutes(30).toNanos();
 
   /**
    * Create a commit builder for committing against an existing dataset.
@@ -196,9 +199,19 @@ public class CommitBuilder {
   /**
    * Set the storage format to use for the dataset.
    *
-   * <p>This is only needed when creating a new empty table. If any data files are passed, the
-   * storage format will be inferred from the data files. Valid values: "legacy", "v2_0", "stable",
-   * "v2_1", "next", "v2_2".
+   * <p>On creation, this sets the default storage version. If omitted, the version is inferred from
+   * homogeneous data files, or uses the stable version for an empty table. Creating from mixed
+   * prewritten files requires an explicit default. For an existing dataset, only overwrite changes
+   * the default; other operations preserve it. Commit finalization validates the referenced file
+   * versions and derives the required mixed-version capability.
+   *
+   * <p>Valid values are the numeric versions ("0.1", "2.0", "2.1", "2.2", "2.3") and the release
+   * selectors ("legacy", "stable", "next"), matching {@link
+   * WriteParams.Builder#withDataStorageVersion(String)}. Parsing is case-insensitive.
+   *
+   * <p>The {@code v}-prefixed spellings ("v2_0", "v2.0", "v2_1", "v2.1", "v2_2", "v2.2") are
+   * deprecated. They were accepted only by this method, never by the rest of Lance, and will be
+   * removed in a future release — use the numeric version instead ("v2_1" becomes "2.1").
    *
    * @param storageFormat the storage format name
    * @return this builder instance
@@ -236,6 +249,29 @@ public class CommitBuilder {
   }
 
   /**
+   * Set a timeout for the commit operation.
+   *
+   * <p>If the commit (including retries on conflict) does not complete within {@code timeout},
+   * {@link #execute(Transaction)} will fail. Pass {@code null} to disable the timeout entirely. The
+   * default is 30 minutes.
+   *
+   * @param timeout the commit timeout, or {@code null} to disable
+   * @return this builder instance
+   * @throws IllegalArgumentException if {@code timeout} is zero or negative
+   */
+  public CommitBuilder commitTimeout(Duration timeout) {
+    if (timeout == null) {
+      this.commitTimeoutNanos = -1L;
+    } else {
+      Preconditions.checkArgument(
+          !timeout.isZero() && !timeout.isNegative(),
+          "commit timeout must be a positive duration; pass null to disable");
+      this.commitTimeoutNanos = timeout.toNanos();
+    }
+    return this;
+  }
+
+  /**
    * Execute the commit with the given transaction.
    *
    * <p>The caller is responsible for closing the transaction (via try-with-resources or {@link
@@ -247,22 +283,25 @@ public class CommitBuilder {
   public Dataset execute(Transaction transaction) {
     Preconditions.checkNotNull(transaction, "Transaction must not be null");
     if (dataset != null) {
-      Dataset result =
-          nativeCommitToDataset(
-              dataset,
-              transaction,
-              detached,
-              enableV2ManifestPaths,
-              writeParams,
-              useStableRowIds,
-              storageFormat,
-              maxRetries,
-              skipAutoCleanup,
-              namespaceClient,
-              tableId,
-              namespaceClientManagedVersioning);
-      result.setAllocator(dataset.allocator());
-      return result;
+      try (LockManager.ReadLock readLock = dataset.acquireReadLock()) {
+        Dataset result =
+            nativeCommitToDataset(
+                dataset,
+                transaction,
+                detached,
+                enableV2ManifestPaths,
+                writeParams,
+                useStableRowIds,
+                storageFormat,
+                maxRetries,
+                skipAutoCleanup,
+                namespaceClient,
+                tableId,
+                namespaceClientManagedVersioning,
+                commitTimeoutNanos);
+        result.setAllocator(dataset.allocator());
+        return result;
+      }
     }
     if (uri != null) {
       Dataset result =
@@ -279,7 +318,8 @@ public class CommitBuilder {
               storageFormat,
               maxRetries,
               skipAutoCleanup,
-              namespaceClientManagedVersioning);
+              namespaceClientManagedVersioning,
+              commitTimeoutNanos);
       result.setAllocator(allocator);
       return result;
     }
@@ -298,7 +338,8 @@ public class CommitBuilder {
       boolean skipAutoCleanup,
       Object namespace,
       Object tableId,
-      boolean namespaceClientManagedVersioning);
+      boolean namespaceClientManagedVersioning,
+      long commitTimeoutNanos);
 
   private static native Dataset nativeCommitToUri(
       String uri,
@@ -313,5 +354,6 @@ public class CommitBuilder {
       String storageFormat,
       int maxRetries,
       boolean skipAutoCleanup,
-      boolean namespaceClientManagedVersioning);
+      boolean namespaceClientManagedVersioning,
+      long commitTimeoutNanos);
 }

@@ -3,7 +3,9 @@
 use std::{sync::Arc, time::Duration};
 
 use arrow_array::{Int32Array, RecordBatch, UInt64Array};
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use std::hint::black_box;
+
+use criterion::{Criterion, criterion_group, criterion_main};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::scalar::ScalarValue;
 use futures::stream;
@@ -18,9 +20,9 @@ use lance_index::scalar::zonemap::{
 };
 use lance_index::scalar::{SargableQuery, registry::ScalarIndexPlugin};
 use lance_io::object_store::ObjectStore;
-use object_store::path::Path;
 #[cfg(target_os = "linux")]
-use pprof::criterion::{Output, PProfProfiler};
+use lance_testing::pprof::{Output, PProfProfiler};
+use object_store::path::Path;
 
 fn bench_zonemap(c: &mut Criterion) {
     const TOTAL: usize = 1_000_000;
@@ -88,7 +90,7 @@ fn bench_zonemap(c: &mut Criterion) {
         .measurement_time(Duration::from_secs(10));
     let details = prost_types::Any::from_msg(&pbold::ZoneMapIndexDetails::default()).unwrap();
     let index = rt
-        .block_on(ZoneMapIndexPlugin.load_index(store, &details, None, &LanceCache::no_cache()))
+        .block_on(ZoneMapIndexPlugin.load_index(store, &details, 0, None, &LanceCache::no_cache()))
         .unwrap();
     group.bench_function(format!("zonemap_search({TOTAL})").as_str(), |b| {
         b.to_async(&rt).iter(|| async {

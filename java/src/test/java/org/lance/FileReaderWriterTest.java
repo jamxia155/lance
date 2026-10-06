@@ -15,6 +15,7 @@ package org.lance;
 
 import org.lance.file.BlobReadMode;
 import org.lance.file.FileReadOptions;
+import org.lance.file.FileWriteOptions;
 import org.lance.file.LanceFileReader;
 import org.lance.file.LanceFileWriter;
 import org.lance.util.Range;
@@ -42,6 +43,7 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -210,6 +212,31 @@ public class FileReaderWriterTest {
   }
 
   @Test
+  void testWriteRejectsZeroMaxPageBytes(@TempDir Path tempDir) {
+    String filePath = tempDir.resolve("page_options.lance").toString();
+    FileWriteOptions options = FileWriteOptions.builder().maxPageBytes(0).build();
+
+    IllegalArgumentException error =
+        Assertions.assertThrows(
+            IllegalArgumentException.class,
+            () -> {
+              try (BufferAllocator allocator = new RootAllocator();
+                  LanceFileWriter writer =
+                      LanceFileWriter.open(
+                          filePath,
+                          allocator,
+                          null,
+                          Optional.empty(),
+                          Collections.emptyMap(),
+                          options);
+                  VectorSchemaRoot batch = createBatch(allocator)) {
+                writer.write(batch);
+              }
+            });
+    assertTrue(error.getMessage().contains("max_page_bytes must be greater than 0, got 0"));
+  }
+
+  @Test
   void testWriteNoData(@TempDir Path tempDir) throws Exception {
     String filePath = tempDir.resolve("no_data.lance").toString();
     BufferAllocator allocator = new RootAllocator();
@@ -256,7 +283,9 @@ public class FileReaderWriterTest {
       LanceFileReader.open("/tmp/does_not_exist.lance", allocator);
       fail("Expected LanceException to be thrown");
     } catch (IOException e) {
-      assertTrue(e.getMessage().contains("Object at location /tmp/does_not_exist.lance not found"));
+      String message = e.getMessage();
+      assertTrue(message.contains("/tmp/does_not_exist.lance"));
+      assertTrue(message.toLowerCase().contains("not found"));
     }
     try {
       LanceFileReader.open("", allocator);

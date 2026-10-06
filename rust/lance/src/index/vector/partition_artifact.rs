@@ -19,7 +19,7 @@ use lance_file::reader::{FileReader, FileReaderOptions};
 use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 use lance_file::versions as file_versions;
 use lance_file::writer::{FileWriter, FileWriterOptions};
-use lance_index::vector::v3::shuffler::ShuffleReader;
+use lance_index::vector::v3::shuffler::{ShufflePartitionWindowPlan, ShuffleReader};
 use lance_index::vector::{PART_ID_COLUMN, PQ_CODE_COLUMN};
 use lance_io::ReadBatchParams;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
@@ -565,6 +565,31 @@ pub(crate) struct PartitionArtifactShuffleReader {
     partitions: Vec<PartitionArtifactPartition>,
     total_loss: Option<f64>,
     file_readers: Mutex<HashMap<String, Arc<FileReader>>>,
+    /// Decoded bytes per row (all artifact columns are fixed width), used to
+    /// size partition-build admission. `None` if the artifact has no rows.
+    estimated_row_bytes: Option<usize>,
+}
+
+/// Admission headroom per partition window, matching Lance's own shuffle
+/// readers: Arrow buffers and batch allocations add a little beyond the
+/// fixed-width values.
+const WINDOW_ADMISSION_FIXED_HEADROOM_BYTES: usize = 1024 * 1024;
+
+/// Bytes per row of a schema whose columns are all fixed width, else `None`.
+fn fixed_row_bytes(schema: &ArrowSchema) -> Option<usize> {
+    fn fixed_width(data_type: &DataType) -> Option<usize> {
+        match data_type {
+            DataType::FixedSizeList(child, size) => {
+                fixed_width(child.data_type()).map(|width| width * *size as usize)
+            }
+            other => other.primitive_width(),
+        }
+    }
+    schema
+        .fields()
+        .iter()
+        .map(|field| fixed_width(field.data_type()))
+        .sum()
 }
 
 /// File version for all files stored inside a partition artifact.
@@ -698,13 +723,25 @@ impl PartitionArtifactShuffleReader {
             object_store.clone(),
             SchedulerConfig::max_bandwidth(&object_store),
         );
-        Ok(Self {
+        let mut reader = Self {
             scheduler,
             root_dir,
             partitions: manifest.partitions,
             total_loss: manifest.total_loss,
             file_readers: Mutex::new(HashMap::new()),
-        })
+            estimated_row_bytes: None,
+        };
+        // Every bucket file shares one schema; read it from the first one.
+        let first_path = reader
+            .partitions
+            .iter()
+            .find_map(|partition| partition.path.clone());
+        if let Some(path) = first_path {
+            let file_reader = reader.open_file_reader(&path).await?;
+            let schema: ArrowSchema = file_reader.schema().as_ref().into();
+            reader.estimated_row_bytes = fixed_row_bytes(&schema);
+        }
+        Ok(reader)
     }
 
     /// Open and cache a file reader for a finalized bucket file.
@@ -813,6 +850,48 @@ impl ShuffleReader for PartitionArtifactShuffleReader {
             .get(partition_id)
             .map(|partition| partition.num_rows)
             .unwrap_or(0))
+    }
+
+    /// Plan a one-partition window with an admission charge based on the
+    /// partition's row count. Without it the trait default charges
+    /// `usize::MAX`, which makes the windowed partition build read artifact
+    /// partitions one at a time.
+    fn plan_partition_window(
+        &self,
+        start_partition_id: usize,
+        max_decoded_bytes: usize,
+    ) -> Result<ShufflePartitionWindowPlan> {
+        if max_decoded_bytes == 0 {
+            return Err(Error::invalid_input(
+                "max_decoded_bytes must be greater than 0",
+            ));
+        }
+        let end_partition_id = start_partition_id.checked_add(1).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "start_partition_id={} cannot be advanced",
+                start_partition_id
+            ))
+        })?;
+        let partition_rows = self.partition_size(start_partition_id)?;
+        let estimated_decoded_bytes = match (partition_rows, self.estimated_row_bytes) {
+            (0, _) => 0,
+            (rows, Some(row_bytes)) => {
+                let value_bytes = rows.checked_mul(row_bytes).ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "decoded byte estimate overflows for {} rows at {} bytes per row",
+                        rows, row_bytes
+                    ))
+                })?;
+                value_bytes
+                    .saturating_add(value_bytes / 4)
+                    .saturating_add(WINDOW_ADMISSION_FIXED_HEADROOM_BYTES)
+            }
+            (_, None) => usize::MAX,
+        };
+        Ok(ShufflePartitionWindowPlan {
+            partition_range: start_partition_id..end_partition_id,
+            estimated_decoded_bytes,
+        })
     }
 
     /// Optional training loss propagated from the backend into the artifact.
@@ -1133,6 +1212,21 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(row_ids, vec![10, 13]);
         assert!(reader.read_partition(2).await.unwrap().is_none());
+
+        // Rows are a u64 row id plus a 2-byte PQ code: 10 bytes each. The
+        // windowed partition build admits on this estimate; without it the
+        // trait default charges usize::MAX and reads partitions one at a time.
+        assert_eq!(reader.estimated_row_bytes, Some(10));
+        let plan = reader.plan_partition_window(0, 1024).unwrap();
+        assert_eq!(plan.partition_range, 0..1);
+        assert_eq!(
+            plan.estimated_decoded_bytes,
+            20 + 20 / 4 + WINDOW_ADMISSION_FIXED_HEADROOM_BYTES
+        );
+        let plan = reader.plan_partition_window(2, 1024).unwrap();
+        assert_eq!(plan.partition_range, 2..3);
+        assert_eq!(plan.estimated_decoded_bytes, 0);
+        assert!(reader.plan_partition_window(0, 0).is_err());
     }
 
     #[tokio::test]

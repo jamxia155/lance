@@ -16,7 +16,8 @@ use lance_core::datatypes::Schema;
 use lance_core::{Error, ROW_ID, Result};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::reader::{FileReader, FileReaderOptions};
-use lance_file::version::LanceFileVersion;
+use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
+use lance_file::versions as file_versions;
 use lance_file::writer::{FileWriter, FileWriterOptions};
 use lance_index::vector::v3::shuffler::ShuffleReader;
 use lance_index::vector::{PART_ID_COLUMN, PQ_CODE_COLUMN};
@@ -325,7 +326,10 @@ impl PartitionArtifactBuilder {
         let manifest_start = Instant::now();
         write_json(
             self.object_store.as_ref(),
-            &self.root_dir.child(PARTITION_ARTIFACT_MANIFEST_FILE_NAME),
+            &self
+                .root_dir
+                .clone()
+                .join(PARTITION_ARTIFACT_MANIFEST_FILE_NAME),
             &manifest,
         )
         .await?;
@@ -496,10 +500,11 @@ impl PartitionArtifactBuilder {
     async fn ensure_final_writer(&mut self, bucket_id: usize) -> Result<&mut FileWriter> {
         if self.final_writers[bucket_id].is_none() {
             let path = self.final_bucket_path(bucket_id);
-            let writer = FileWriter::try_new(
+            let writer = file_versions::create_writer(
+                partition_artifact_file_version()?,
                 self.object_store.create(&path).await?,
                 Schema::try_from(self.final_schema.as_ref())?,
-                file_writer_options()?,
+                FileWriterOptions::default(),
             )?;
             self.final_writers[bucket_id] = Some(writer);
         }
@@ -511,8 +516,9 @@ impl PartitionArtifactBuilder {
     /// Path of the finalized file for one bucket.
     fn final_bucket_path(&self, bucket_id: usize) -> Path {
         self.root_dir
-            .child(PARTITION_ARTIFACT_PARTITIONS_DIR)
-            .child(format!(
+            .clone()
+            .join(PARTITION_ARTIFACT_PARTITIONS_DIR)
+            .join(format!(
                 "{PARTITION_ARTIFACT_BUCKET_PREFIX}{bucket_id:05}.lance"
             ))
     }
@@ -561,24 +567,20 @@ pub(crate) struct PartitionArtifactShuffleReader {
     file_readers: Mutex<HashMap<String, Arc<FileReader>>>,
 }
 
-/// Writer options for all files stored inside a partition artifact.
+/// File version for all files stored inside a partition artifact.
 ///
 /// The artifact uses a fixed file version so external backends and Lance
 /// finalization agree on the on-disk layout.
-fn file_writer_options() -> Result<FileWriterOptions> {
-    Ok(FileWriterOptions {
-        format_version: Some(
-            PARTITION_ARTIFACT_FILE_VERSION
-                .parse::<LanceFileVersion>()
-                .map_err(|error| {
-                    Error::invalid_input(format!(
-                        "invalid partition artifact file version '{}': {}",
-                        PARTITION_ARTIFACT_FILE_VERSION, error
-                    ))
-                })?,
-        ),
-        ..Default::default()
-    })
+fn partition_artifact_file_version() -> Result<ConcreteFileVersion> {
+    Ok(PARTITION_ARTIFACT_FILE_VERSION
+        .parse::<LanceFileVersion>()
+        .map_err(|error| {
+            Error::invalid_input(format!(
+                "invalid partition artifact file version '{}': {}",
+                PARTITION_ARTIFACT_FILE_VERSION, error
+            ))
+        })?
+        .resolve())
 }
 
 /// Validate that a backend-produced batch matches the artifact contract.
@@ -669,7 +671,7 @@ impl PartitionArtifactShuffleReader {
     /// This reads the manifest once, validates it, and initializes the shared
     /// scheduler and reader cache used by partition reads.
     async fn try_open_with_store(object_store: Arc<ObjectStore>, root_dir: Path) -> Result<Self> {
-        let manifest_path = root_dir.child("manifest.json");
+        let manifest_path = root_dir.clone().join("manifest.json");
         let manifest_bytes = object_store.read_one_all(&manifest_path).await?;
         let manifest: PartitionArtifactManifest =
             serde_json::from_slice(&manifest_bytes).map_err(|error| {
@@ -746,7 +748,7 @@ fn join_relative_path(root_dir: &Path, relative_path: &str) -> Path {
     relative_path
         .split('/')
         .filter(|segment| !segment.is_empty())
-        .fold(root_dir.clone(), |path, segment| path.child(segment))
+        .fold(root_dir.clone(), |path, segment| path.join(segment))
 }
 
 #[async_trait::async_trait]
@@ -793,12 +795,14 @@ impl ShuffleReader for PartitionArtifactShuffleReader {
         let schema = Arc::new(reader.schema().as_ref().into());
         Ok(Some(Box::new(RecordBatchStreamAdapter::new(
             schema,
-            reader.read_stream(
-                ReadBatchParams::Ranges(ranges.into()),
-                u32::MAX,
-                16,
-                FilterExpression::no_filter(),
-            )?,
+            reader
+                .read_stream(
+                    ReadBatchParams::Ranges(ranges.into()),
+                    u32::MAX,
+                    16,
+                    FilterExpression::no_filter(),
+                )
+                .await?,
         ))))
     }
 
@@ -860,7 +864,7 @@ mod tests {
     use lance_arrow::FixedSizeListArrayExt;
     use lance_core::ROW_ID;
     use lance_core::datatypes::Schema;
-    use lance_file::writer::{FileWriter, FileWriterOptions};
+    use lance_file::writer::FileWriterOptions;
     use lance_io::object_store::ObjectStore;
 
     use crate::Error;
@@ -1023,7 +1027,7 @@ mod tests {
 
         let object_store = Arc::new(ObjectStore::local());
         let root_path = Path::from_filesystem_path(&root_dir).unwrap();
-        let partition_path = root_path.child("partitions").child("bucket-00000.lance");
+        let partition_path = root_path.clone().join("partitions").join("bucket-00000.lance");
         let schema = Arc::new(arrow_schema::Schema::new(vec![
             arrow_schema::Field::new(ROW_ID, arrow_schema::DataType::UInt64, false),
             arrow_schema::Field::new(
@@ -1039,7 +1043,8 @@ mod tests {
                 true,
             ),
         ]));
-        let mut writer = FileWriter::try_new(
+        let mut writer = file_versions::create_writer(
+            partition_artifact_file_version().unwrap(),
             object_store.create(&partition_path).await.unwrap(),
             Schema::try_from(schema.as_ref()).unwrap(),
             FileWriterOptions::default(),

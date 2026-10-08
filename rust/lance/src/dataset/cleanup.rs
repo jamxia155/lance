@@ -52,6 +52,7 @@ use lance_core::{
 };
 use lance_io::object_store::ObjectStore;
 use lance_table::{
+    feature_flags::{ensure_can_read_manifest, ensure_can_write_manifest},
     format::{IndexMetadata, Manifest},
     io::{
         commit::ManifestLocation,
@@ -61,13 +62,15 @@ use lance_table::{
 };
 use object_store::ObjectMeta;
 use object_store::path::Path;
+use prost::Message;
 use std::fmt::Debug;
 use std::{
     collections::{HashMap, HashSet},
     future,
-    sync::{Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard},
     time::Duration,
 };
+use tokio::sync::OnceCell;
 use tokio::time::{MissedTickBehavior, interval};
 use tokio_stream::wrappers::IntervalStream;
 use tracing::{Span, debug, info, instrument, warn};
@@ -75,6 +78,7 @@ use tracing::{Span, debug, info, instrument, warn};
 #[derive(Clone, Debug, Default)]
 struct ReferencedFiles {
     data_paths: HashSet<Path>,
+    managed_blob_paths: HashSet<Path>,
     delete_paths: HashSet<Path>,
     tx_paths: HashSet<Path>,
     index_uuids: HashSet<String>,
@@ -307,6 +311,18 @@ struct CleanupTask<'a> {
     include_referenced_branches: bool,
 }
 
+/// The visible descriptor rows and base namespace used by one fragment scan.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ManagedScanKey {
+    store_prefix: String,
+    data_dir: Path,
+    bases: Vec<(u32, String, bool)>,
+    fragment: Vec<u8>,
+    fields: Vec<arrow_schema::Field>,
+    field_ids: Vec<i32>,
+    retained: bool,
+}
+
 /// A manifest that has aged out and is queued for deletion.
 #[derive(Clone, Debug)]
 struct ExpiredManifest {
@@ -319,6 +335,9 @@ struct ExpiredManifest {
 /// Information about the dataset that we learn by inspecting all of the manifests
 #[derive(Clone, Debug, Default)]
 struct CleanupInspection {
+    // Completed scans have already added their paths to the sets below. Keep
+    // only whether they found owner paths, not another copy of all references.
+    managed_scans: HashMap<ManagedScanKey, Arc<OnceCell<bool>>>,
     old_manifests: HashMap<Path, ExpiredManifest>,
     /// Store records to retire once their manifests are gone, by version;
     /// see `CommitHandler::forget_version`.
@@ -568,6 +587,95 @@ impl<'a> CleanupTask<'a> {
         Ok(inspection.into_inner().unwrap())
     }
 
+    async fn inspect_managed_blobs(
+        &self,
+        dataset: &Dataset,
+        retained: bool,
+        inspection: &Mutex<CleanupInspection>,
+    ) -> Result<bool> {
+        let names = dataset
+            .schema()
+            .fields
+            .iter()
+            .filter(|field| super::blob::field_contains_blob(field))
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>();
+        if names.is_empty() {
+            return Ok(false);
+        }
+        let projection = dataset.schema().project(&names)?;
+        let fields = projection
+            .fields
+            .iter()
+            .map(arrow_schema::Field::from)
+            .collect::<Vec<_>>();
+        let field_ids = projection.field_ids();
+        let mut bases = dataset
+            .manifest
+            .base_paths
+            .iter()
+            .map(|(id, base)| (*id, base.path.clone(), base.is_dataset_root))
+            .collect::<Vec<_>>();
+        bases.sort_unstable();
+        let mut found = false;
+        // Manifests are already read concurrently. Scan their fragments in order
+        // to avoid multiplying concurrent descriptor buffers and path sets.
+        for fragment in dataset.get_fragments() {
+            let key = ManagedScanKey {
+                store_prefix: dataset.object_store.store_prefix.clone(),
+                data_dir: dataset.data_dir(),
+                bases: bases.clone(),
+                fragment: lance_table::format::pb::DataFragment::from(&fragment.metadata)
+                    .encode_to_vec(),
+                fields: fields.clone(),
+                field_ids: field_ids.clone(),
+                retained,
+            };
+            let cell = inspection
+                .lock()
+                .unwrap()
+                .managed_scans
+                .entry(key)
+                .or_default()
+                .clone();
+            let scanned = cell
+                .get_or_try_init(|| async {
+                    let paths =
+                        super::blob::managed_paths(dataset, self.dataset, fragment.scan()).await?;
+                    let found = !paths.is_empty();
+                    let mut inspection = inspection.lock().unwrap();
+                    for path in paths {
+                        let relative = remove_prefix(&path, &self.dataset.base);
+                        if retained {
+                            inspection
+                                .verified_files
+                                .managed_blob_paths
+                                .remove(&relative);
+                            inspection
+                                .referenced_files
+                                .managed_blob_paths
+                                .insert(relative);
+                        } else {
+                            inspection
+                                .verified_files
+                                .managed_blob_paths
+                                .insert(relative);
+                        }
+                    }
+                    Ok::<_, Error>(found)
+                })
+                .await;
+            match scanned {
+                Ok(has_paths) => found |= *has_paths,
+                // An expired descriptor can disappear during concurrent cleanup.
+                // Do not mark failed scans complete: retained reads must still fail.
+                Err(error) if !retained && error.is_not_found() => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(found)
+    }
+
     async fn process_manifest_file(
         &self,
         location: ManifestLocation,
@@ -583,6 +691,8 @@ impl<'a> CleanupTask<'a> {
         let manifest_and_indexes = async {
             let manifest =
                 read_manifest(&self.dataset.object_store, &location.path, location.size).await?;
+            ensure_can_read_manifest(&manifest)?;
+            ensure_can_write_manifest(&manifest)?;
             let indexes =
                 read_manifest_indexes(&self.dataset.object_store, &location, &manifest).await?;
             Ok::<_, Error>((manifest, indexes))
@@ -617,6 +727,14 @@ impl<'a> CleanupTask<'a> {
         let is_latest = self.read_version <= manifest.version;
         let is_tagged = tagged_versions.contains(&manifest.version);
         let in_working_set = is_latest || !self.policy.should_clean(&manifest) || is_tagged;
+        if manifest.has_managed_blobs() {
+            let snapshot = self
+                .dataset
+                .checkout_version((manifest.branch.as_deref(), Some(manifest.version)))
+                .await?;
+            self.inspect_managed_blobs(&snapshot, in_working_set, inspection)
+                .await?;
+        }
         let mut inspection = inspection.lock().unwrap();
 
         // Track tagged old versions in case we want to return a `CleanupError` later.
@@ -869,6 +987,10 @@ impl<'a> CleanupTask<'a> {
             build_listing_stream(self.dataset.versions_dir(), unmodified_since),
             build_listing_stream(self.dataset.transactions_dir(), unmodified_since),
             build_listing_stream(self.dataset.data_dir(), data_unmodified_since),
+            build_listing_stream(
+                self.dataset.base.clone().join("_blobs"),
+                data_unmodified_since,
+            ),
             // Index UUIDs from manifests being removed are proof that their files are
             // safe to delete. Scan every index artifact while that proof is available;
             // a retained-manifest cutoff can otherwise skip newer artifacts and lose
@@ -1193,6 +1315,33 @@ impl<'a> CleanupTask<'a> {
                 }
             }
             Some("blob") => {
+                if inspection
+                    .referenced_files
+                    .managed_blob_paths
+                    .contains(&relative_path)
+                {
+                    return Ok(None);
+                }
+                if relative_path
+                    .parts()
+                    .next()
+                    .is_some_and(|part| part.as_ref() == "_blobs")
+                {
+                    let verified = inspection
+                        .verified_files
+                        .managed_blob_paths
+                        .contains(&relative_path);
+                    return if verified || !maybe_in_progress {
+                        Ok(cleanup_file(
+                            path,
+                            CleanupFileKind::Data,
+                            !verified,
+                            size_bytes,
+                        ))
+                    } else {
+                        Ok(None)
+                    };
+                }
                 // Blob v2 sidecar files are keyed by the data file stem:
                 //   data/{data_file_key}/{obfuscated_blob_id:032b}.blob
                 //
@@ -1253,6 +1402,10 @@ impl<'a> CleanupTask<'a> {
                     .verified_files
                     .data_paths
                     .contains(&parent_data_path)
+                    || inspection
+                        .verified_files
+                        .managed_blob_paths
+                        .contains(&relative_path)
                 {
                     Ok(cleanup_file(path, CleanupFileKind::Data, false, size_bytes))
                 } else {
@@ -1342,26 +1495,38 @@ impl<'a> CleanupTask<'a> {
                 let referenced_branches = &referenced_branches;
 
                 async move {
-                    let manifest_location = dataset
-                        .commit_handler
-                        .resolve_version_location(
-                            &dataset.base,
-                            *referenced_version,
-                            &dataset.object_store.inner,
+                    let manifest = async {
+                        let manifest_location = dataset
+                            .commit_handler
+                            .resolve_version_location(
+                                &dataset.base,
+                                *referenced_version,
+                                &dataset.object_store.inner,
+                            )
+                            .await?;
+
+                        read_manifest(
+                            &dataset.object_store,
+                            &manifest_location.path,
+                            manifest_location.size,
                         )
-                        .await?;
-
-                    let manifest = read_manifest(
-                        &dataset.object_store,
-                        &manifest_location.path,
-                        manifest_location.size,
-                    )
+                        .await
+                    }
                     .await;
-
-                    if let Ok(manifest) = manifest
-                        && policy.should_clean(&manifest)
-                    {
-                        referenced_branches.insert(branch_name.clone());
+                    match manifest {
+                        Ok(manifest) => {
+                            ensure_can_read_manifest(&manifest)?;
+                            ensure_can_write_manifest(&manifest)?;
+                            if policy.should_clean(&manifest) {
+                                referenced_branches.insert(branch_name.clone());
+                            }
+                        }
+                        Err(error) if error.is_not_found() => {
+                            // The source may be gone while descendants still use its files.
+                            // Scan their manifests before deleting any parent data.
+                            referenced_branches.insert(branch_name.clone());
+                        }
+                        Err(error) => return Err(error),
                     }
                     Ok::<(), Error>(())
                 }
@@ -1572,6 +1737,18 @@ impl<'a> CleanupTask<'a> {
     ) -> Result<()> {
         let manifest =
             read_manifest(&self.dataset.object_store, &location.path, location.size).await?;
+        ensure_can_read_manifest(&manifest)?;
+        ensure_can_write_manifest(&manifest)?;
+        let managed_referenced = if manifest.has_managed_blobs() {
+            let snapshot = self
+                .dataset
+                .checkout_version((manifest.branch.as_deref(), Some(manifest.version)))
+                .await?;
+            self.inspect_managed_blobs(&snapshot, true, inspection)
+                .await?
+        } else {
+            false
+        };
         let indexes =
             read_manifest_indexes(&self.dataset.object_store, &location, &manifest).await?;
 
@@ -1604,7 +1781,7 @@ impl<'a> CleanupTask<'a> {
         }
 
         let mut inspection = inspection.lock().unwrap();
-        let mut is_referenced = false;
+        let mut is_referenced = managed_referenced;
 
         for fragment in manifest.fragments.iter() {
             for file in fragment.referenced_lance_files() {
@@ -2091,7 +2268,10 @@ fn tagged_old_versions_cleanup_error(
 mod tests {
     use std::{
         collections::HashMap,
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
     };
 
     use super::*;
@@ -2119,6 +2299,7 @@ mod tests {
     use lance_table::io::commit::RenameCommitHandler;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector, some_batch};
     use mock_instant::thread_local::MockClock;
+    use object_store::ObjectStoreExt;
     use rstest::rstest;
     use uuid::Uuid;
 
@@ -2568,6 +2749,328 @@ mod tests {
             vec![Ok(batch)].into_iter(),
             schema,
         ))
+    }
+
+    // Tiny dedicated objects make individual row retention observable without
+    // large payloads or partially live packed objects masking a missing reference.
+    fn managed_blob_batch() -> RecordBatch {
+        let mut blobs = BlobArrayBuilder::new(2);
+        blobs.push_bytes(b"first").unwrap();
+        blobs.push_bytes(b"second").unwrap();
+        let field = blob_field("blob", false).with_metadata(HashMap::from([
+            ("ARROW:extension:name".into(), "lance.blob.v2".into()),
+            (
+                "lance-encoding:blob-inline-size-threshold".into(),
+                "0".into(),
+            ),
+            (
+                "lance-encoding:blob-dedicated-size-threshold".into(),
+                "1".into(),
+            ),
+        ]));
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            field,
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![0, 1])),
+                blobs.finish().unwrap(),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[rstest]
+    #[case::unprotected(None)]
+    #[case::tag(Some("tag"))]
+    #[case::branch(Some("branch"))]
+    #[tokio::test]
+    async fn managed_cleanup_preserves_protected_rows(#[case] protection: Option<&str>) {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        let batch = managed_blob_batch();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            &fixture.dataset_path,
+            Some(WriteParams {
+                store_params: Some(fixture.os_params()),
+                data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.update_config([("before", "delete")]).await.unwrap();
+        let protected_version = dataset.version_id();
+        let protected = match protection {
+            Some("tag") => {
+                dataset
+                    .tags()
+                    .create("keep", protected_version)
+                    .await
+                    .unwrap();
+                Some(dataset.clone())
+            }
+            Some("branch") => Some(
+                fixture
+                    .create_branch_and_load(&mut dataset, "keep", protected_version)
+                    .await
+                    .unwrap(),
+            ),
+            _ => None,
+        };
+        dataset.delete("id = 0").await.unwrap();
+        dataset.update_config([("after", "delete")]).await.unwrap();
+        dataset
+            .cleanup(CleanupPolicy {
+                before_version: Some(dataset.version_id()),
+                error_if_tagged_old_versions: false,
+                ..Default::default()
+            })
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture.count_blob_files().await.unwrap(),
+            if protected.is_some() { 2 } else { 1 }
+        );
+        let values = Arc::new(dataset)
+            .take_blobs_by_indices(&[0], "blob")
+            .await
+            .unwrap();
+        assert_eq!(
+            values[0].as_ref().unwrap().read().await.unwrap().as_ref(),
+            b"second"
+        );
+        if let Some(protected) = protected {
+            let values = Arc::new(protected)
+                .take_blobs_by_indices(&[0], "blob")
+                .await
+                .unwrap();
+            assert_eq!(
+                values[0].as_ref().unwrap().read().await.unwrap().as_ref(),
+                b"first"
+            );
+        }
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn managed_cleanup_distinguishes_column_projections(
+        #[values(false, true)] keep_old: bool,
+    ) {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        let batch = managed_blob_batch();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            batch.schema().field(0).clone(),
+            batch.schema().field(1).clone(),
+            batch.schema().field(1).clone().with_name("other"),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                batch.column(0).clone(),
+                batch.column(1).clone(),
+                batch.column(1).clone(),
+            ],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            &fixture.dataset_path,
+            Some(WriteParams {
+                store_params: Some(fixture.os_params()),
+                data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.update_config([("before", "drop")]).await.unwrap();
+        let old = dataset.clone();
+        if keep_old {
+            dataset
+                .tags()
+                .create("keep", dataset.version_id())
+                .await
+                .unwrap();
+        }
+        dataset.drop_columns(&["other"]).await.unwrap();
+        dataset.update_config([("after", "drop")]).await.unwrap();
+        assert_eq!(fixture.count_blob_files().await.unwrap(), 4);
+        if keep_old {
+            // Both views are retained and share the physical file. Scanning the
+            // narrower view first must not hide the old view's second column.
+            let task = CleanupTask::new(&dataset, CleanupPolicy::default(), CleanupAction::Execute);
+            let inspection = Mutex::new(CleanupInspection::default());
+            task.inspect_managed_blobs(&dataset, true, &inspection)
+                .await
+                .unwrap();
+            task.inspect_managed_blobs(&old, true, &inspection)
+                .await
+                .unwrap();
+            assert_eq!(
+                inspection
+                    .lock()
+                    .unwrap()
+                    .referenced_files
+                    .managed_blob_paths
+                    .len(),
+                4
+            );
+        }
+        dataset
+            .cleanup(CleanupPolicy {
+                before_version: Some(dataset.version_id()),
+                error_if_tagged_old_versions: false,
+                ..Default::default()
+            })
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture.count_blob_files().await.unwrap(),
+            if keep_old { 4 } else { 2 }
+        );
+        let values = Arc::new(dataset)
+            .take_blobs_by_indices(&[0, 1], "blob")
+            .await
+            .unwrap();
+        for (value, expected) in values
+            .iter()
+            .zip([b"first".as_slice(), b"second".as_slice()])
+        {
+            assert_eq!(
+                value.as_ref().unwrap().read().await.unwrap().as_ref(),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_cleanup_deduplicates_reads_and_retries_failures() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        let batch = managed_blob_batch();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            &fixture.dataset_path,
+            Some(WriteParams {
+                store_params: Some(fixture.os_params()),
+                data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.update_config([("version", "2")]).await.unwrap();
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let read_count = reads.clone();
+        fixture.mock_store.policy.lock().unwrap().set_before_policy(
+            "count_descriptors",
+            Arc::new(move |op, path| {
+                if op.starts_with("get") && path.extension() == Some("lance") {
+                    read_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                Ok(())
+            }),
+        );
+        let task = CleanupTask::new(&dataset, CleanupPolicy::default(), CleanupAction::Execute);
+        // Warm the session's file metadata cache, then measure one descriptor scan.
+        for _ in 0..2 {
+            reads.store(0, std::sync::atomic::Ordering::SeqCst);
+            task.inspect_managed_blobs(&dataset, false, &Mutex::new(CleanupInspection::default()))
+                .await
+                .unwrap();
+        }
+        let single_scan_reads = reads.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(single_scan_reads > 0);
+        let inspection = Mutex::new(CleanupInspection::default());
+        for retained in [false, true] {
+            let before = reads.load(std::sync::atomic::Ordering::SeqCst);
+            let scans = (0..8).map(|_| task.inspect_managed_blobs(&dataset, retained, &inspection));
+            for result in futures::future::join_all(scans).await {
+                assert!(result.unwrap());
+            }
+            let after = reads.load(std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(after - before, single_scan_reads);
+            task.inspect_managed_blobs(&dataset, retained, &inspection)
+                .await
+                .unwrap();
+            assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), after);
+        }
+        assert_eq!(inspection.lock().unwrap().managed_scans.len(), 2);
+        assert_eq!(
+            inspection
+                .lock()
+                .unwrap()
+                .referenced_files
+                .managed_blob_paths
+                .len(),
+            2
+        );
+
+        let file = dataset
+            .data_dir()
+            .join(dataset.manifest.fragments[0].files[0].path.as_str());
+        let saved = dataset
+            .object_store
+            .inner
+            .get(&file)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        dataset.object_store.inner.delete(&file).await.unwrap();
+        let before = fixture.count_files().await.unwrap();
+        let result = dataset
+            .cleanup(CleanupPolicy {
+                before_version: Some(dataset.version_id()),
+                ..Default::default()
+            })
+            .execute()
+            .await;
+        assert!(result.unwrap_err().is_not_found());
+        assert_eq!(fixture.count_files().await.unwrap(), before);
+        assert_eq!(fixture.count_blob_files().await.unwrap(), 2);
+
+        // A missing expired descriptor must not publish successful completion.
+        let inspection = Mutex::new(CleanupInspection::default());
+        assert!(
+            !task
+                .inspect_managed_blobs(&dataset, false, &inspection)
+                .await
+                .unwrap()
+        );
+        assert!(
+            inspection
+                .lock()
+                .unwrap()
+                .managed_scans
+                .values()
+                .all(|cell| cell.get().is_none())
+        );
+        dataset
+            .object_store
+            .inner
+            .put(&file, saved.into())
+            .await
+            .unwrap();
+        assert!(
+            task.inspect_managed_blobs(&dataset, false, &inspection)
+                .await
+                .unwrap()
+        );
+        dataset
+            .cleanup(CleanupPolicy {
+                before_version: Some(dataset.version_id()),
+                ..Default::default()
+            })
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(fixture.count_blob_files().await.unwrap(), 2);
     }
 
     #[tokio::test]
@@ -3195,6 +3698,13 @@ mod tests {
             fixture.create_some_data().await.unwrap();
             fixture.block_commits();
             assert!(fixture.append_some_data().await.is_err());
+            let dataset = fixture.open().await.unwrap();
+            let blob_path = dataset.base.clone().join("_blobs").join("orphan.blob");
+            dataset
+                .object_store
+                .put(&blob_path, b"orphan")
+                .await
+                .unwrap();
 
             let age = if old_files {
                 TimeDelta::try_days(UNVERIFIED_THRESHOLD_DAYS + 1).unwrap()
@@ -3220,6 +3730,11 @@ mod tests {
             let should_delete = override_opt.unwrap_or(false) || old_files;
 
             let after_count = fixture.count_files().await.unwrap();
+            assert_eq!(
+                dataset.object_store.exists(&blob_path).await.unwrap(),
+                !should_delete,
+                "override={override_opt:?}, old_files={old_files}"
+            );
             assert_eq!(removed.old_versions, 0);
             assert_eq!(
                 removed.bytes_removed,
@@ -3232,6 +3747,80 @@ mod tests {
                 assert_eq!(removed.bytes_removed, 0);
             }
         }
+    }
+
+    #[rstest]
+    #[case::head_error(Some(0))]
+    #[case::read_error(Some(1))]
+    #[case::missing_source(None)]
+    #[tokio::test]
+    async fn cleanup_preserves_child_after_source_manifest_failure(
+        #[case] fail_request: Option<usize>,
+    ) {
+        MockClock::set_system_time(std::time::Duration::ZERO);
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        let mut parent = fixture.open().await.unwrap();
+        let source_manifest = parent.manifest_location.path.clone();
+        let child = fixture
+            .create_branch_and_load(&mut parent, "child", (None, None))
+            .await
+            .unwrap();
+        let expected = child.scan().try_into_batch().await.unwrap();
+        MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
+        fixture.overwrite_some_data().await.unwrap();
+
+        let source_reads = Arc::new(AtomicUsize::new(0));
+        if let Some(fail_request) = fail_request {
+            let source_reads = source_reads.clone();
+            fixture.mock_store.policy.lock().unwrap().set_before_policy(
+                "fail_branch_source",
+                Arc::new(move |operation, path| {
+                    // get_opts serves both HEAD (first) and the subsequent range read.
+                    if operation == "get_opts"
+                        && path == &source_manifest
+                        && source_reads.fetch_add(1, Ordering::SeqCst) == fail_request
+                    {
+                        return Err(Error::internal("transient branch source read"));
+                    }
+                    Ok(())
+                }),
+            );
+        } else {
+            parent
+                .object_store
+                .inner
+                .delete(&source_manifest)
+                .await
+                .unwrap();
+        }
+        let before = fixture.count_files().await.unwrap();
+        let policy = CleanupPolicy {
+            before_version: Some(2),
+            error_if_tagged_old_versions: false,
+            ..Default::default()
+        };
+        let result = fixture.run_cleanup_with_policy(policy.clone()).await;
+        if let Some(fail_request) = fail_request {
+            let error = result.unwrap_err();
+            assert!(matches!(error, Error::IO { .. }), "{error}");
+            assert_contains!(error.to_string(), "transient branch source read");
+            assert_eq!(source_reads.load(Ordering::SeqCst), fail_request + 1);
+            let after = fixture.count_files().await.unwrap();
+            assert_eq!(after.num_data_files, before.num_data_files);
+            assert_eq!(after.num_manifest_files, before.num_manifest_files);
+            fixture
+                .mock_store
+                .policy
+                .lock()
+                .unwrap()
+                .clear_before_policy("fail_branch_source");
+            let retried = fixture.run_cleanup_with_policy(policy).await.unwrap();
+            assert_eq!(retried.data_files_removed, 0);
+        } else {
+            assert_eq!(result.unwrap().data_files_removed, 0);
+        }
+        assert_eq!(child.scan().try_into_batch().await.unwrap(), expected);
     }
 
     #[tokio::test]

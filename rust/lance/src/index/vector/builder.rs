@@ -435,9 +435,46 @@ fn partition_window_entry_limit(
 struct PartitionBuildTimes {
     take_nanos: AtomicU64,
     build_nanos: AtomicU64,
+    windows: AtomicU64,
+    window_partitions: AtomicU64,
+    window_admission_bytes: AtomicU64,
+    reads_in_flight: AtomicU64,
+    peak_reads_in_flight: AtomicU64,
 }
 
 impl PartitionBuildTimes {
+    fn add_window(&self, partitions: usize, admission_bytes: usize) {
+        self.windows.fetch_add(1, AtomicOrdering::Relaxed);
+        self.window_partitions
+            .fetch_add(partitions as u64, AtomicOrdering::Relaxed);
+        self.window_admission_bytes
+            .fetch_add(admission_bytes as u64, AtomicOrdering::Relaxed);
+    }
+
+    fn read_started(&self) {
+        let in_flight = self.reads_in_flight.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+        self.peak_reads_in_flight
+            .fetch_max(in_flight, AtomicOrdering::Relaxed);
+    }
+
+    fn read_finished(&self) {
+        self.reads_in_flight.fetch_sub(1, AtomicOrdering::Relaxed);
+    }
+
+    fn window_summary(&self) -> String {
+        let windows = self.windows.load(AtomicOrdering::Relaxed);
+        let divisor = windows.max(1) as f64;
+        format!(
+            "windows={} avg_window_partitions={:.2} avg_window_admission_mib={:.1} peak_reads_in_flight={}",
+            windows,
+            self.window_partitions.load(AtomicOrdering::Relaxed) as f64 / divisor,
+            self.window_admission_bytes.load(AtomicOrdering::Relaxed) as f64
+                / divisor
+                / (1024.0 * 1024.0),
+            self.peak_reads_in_flight.load(AtomicOrdering::Relaxed),
+        )
+    }
+
     fn add_take(&self, elapsed: Duration) {
         self.take_nanos
             .fetch_add(elapsed.as_nanos() as u64, AtomicOrdering::Relaxed);
@@ -1511,6 +1548,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 }
                 let next_partition_id = plan.partition_range.end;
                 let planned_range = plan.partition_range;
+                times.add_window(planned_range.len(), plan.estimated_decoded_bytes);
                 let window_entry_limit = partition_window_entry_limit(
                     &planned_range,
                     num_partitions,
@@ -1521,6 +1559,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     plan.estimated_decoded_bytes,
                     move |mut admission| async move {
                         let take_start = Instant::now();
+                        times.read_started();
                         let mut window = reader
                             .read_partition_window(
                                 planned_range.start,
@@ -1588,6 +1627,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                                 loss,
                             });
                         }
+                        times.read_finished();
                         times.add_take(take_start.elapsed());
                         admission.reconcile(decoded_bytes);
 
@@ -2097,6 +2137,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             index_batch_time.as_secs_f64(),
             index_write_time.as_secs_f64(),
             finish_time.as_secs_f64(),
+        );
+
+        eprintln!(
+            "lance vector merge_partitions windows: {}",
+            self.partition_build_times.window_summary(),
         );
 
         log::info!("merging {} partitions done", ivf.num_partitions());

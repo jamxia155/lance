@@ -45,12 +45,12 @@ use crate::{
     },
 };
 
-static SCHEDULE_NANOS: AtomicU64 = AtomicU64::new(0);
-static ENCODE_WAIT_NANOS: AtomicU64 = AtomicU64::new(0);
-static PAGE_WRITE_NANOS: AtomicU64 = AtomicU64::new(0);
-static FLUSH_NANOS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static SCHEDULE_NANOS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static ENCODE_WAIT_NANOS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static PAGE_WRITE_NANOS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static FLUSH_NANOS: AtomicU64 = AtomicU64::new(0);
 
-/// Where `write_batch` spends its time, summed over every v2.1+ writer in the
+/// Where `write_batch` spends its time, summed over every v2.0+ writer in the
 /// process since the last [`reset_write_timings`].
 #[derive(Debug, Clone, Copy, Default)]
 pub struct WriteTimings {
@@ -88,7 +88,7 @@ pub fn reset_write_timings() {
     }
 }
 
-fn add_nanos(nanos: &AtomicU64, start: Instant) {
+pub(crate) fn add_nanos(nanos: &AtomicU64, start: Instant) {
     nanos.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
 }
 

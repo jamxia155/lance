@@ -4,6 +4,7 @@
 use core::panic;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use arrow_array::{ArrayRef, RecordBatch};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
@@ -33,6 +34,9 @@ use crate::format::MAGIC;
 use crate::format::pb;
 use crate::format::pbfile;
 use crate::format::pbfile::DirectEncoding;
+use crate::writer::structural::{
+    ENCODE_WAIT_NANOS, FLUSH_NANOS, PAGE_WRITE_NANOS, SCHEDULE_NANOS, add_nanos,
+};
 use crate::writer::{
     ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, ExpectedTypes, FileWriteSummary, FileWriterOptions,
     PAGE_BUFFER_ALIGNMENT,
@@ -286,16 +290,25 @@ impl Writer {
         //
         // Also, there is no point in trying to make write_page parallel anyways
         // because we wouldn't want buffers getting mixed up across pages.
-        while let Some(encoding_task) = encoding_tasks.next().await {
+        loop {
+            let wait_start = Instant::now();
+            let Some(encoding_task) = encoding_tasks.next().await else {
+                break;
+            };
+            add_nanos(&ENCODE_WAIT_NANOS, wait_start);
             let encoded_page = encoding_task?;
+            let write_start = Instant::now();
             self.write_page(encoded_page).await?;
+            add_nanos(&PAGE_WRITE_NANOS, write_start);
         }
         // Flushing here reaps any upload that has already failed, so the error
         // is attributed to this batch rather than to whichever later batch or
         // the shutdown happens to poll the writer next. It does not wait for
         // in-flight uploads: those are spawned tasks the runtime drives on its
         // own, and blocking on them would stall the next batch behind them.
+        let flush_start = Instant::now();
         self.writer.flush().await?;
+        add_nanos(&FLUSH_NANOS, flush_start);
         Ok(())
     }
 
@@ -476,6 +489,7 @@ impl Writer {
         }
         // First we push each array into its column writer.  This may or may not generate enough
         // data to trigger an encoding task.  We collect any encoding tasks into a queue.
+        let schedule_start = Instant::now();
         let mut external_buffers =
             OutOfLineBuffers::new(self.tell().await?, PAGE_BUFFER_ALIGNMENT as u64);
         let encoding_tasks = self.encode_columns(&field_arrays, &mut external_buffers)?;
@@ -488,6 +502,7 @@ impl Writer {
             .into_iter()
             .flatten()
             .collect::<FuturesOrdered<_>>();
+        add_nanos(&SCHEDULE_NANOS, schedule_start);
 
         // `write_batch` advances every field by the same amount, so the longest
         // column simply grows by `num_rows`. Guard against overflowing the row

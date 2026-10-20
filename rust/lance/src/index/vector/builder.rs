@@ -145,6 +145,9 @@ struct PartitionSplit {
 const PARTITION_BUILD_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 /// Bound ready-map overhead even when many consecutive partitions are empty.
 const PARTITION_BUILD_ENTRIES_PER_WORKER: usize = 2;
+/// Overrides the decoded-byte target of one partition read window, for
+/// experiments on how window size limits merge concurrency.
+const PARTITION_WINDOW_BYTES_ENV: &str = "LANCE_PARTITION_WINDOW_BYTES";
 
 #[derive(Debug, Clone, Copy)]
 struct FreshPartitionBuildLimits {
@@ -158,6 +161,35 @@ impl Default for FreshPartitionBuildLimits {
             window_bytes: DEFAULT_PARTITION_WINDOW_BYTES,
             decoded_budget_bytes: PARTITION_BUILD_BUDGET_BYTES,
         }
+    }
+}
+
+impl FreshPartitionBuildLimits {
+    /// The default limits, with `window_bytes` taken from
+    /// `LANCE_PARTITION_WINDOW_BYTES` when it is set.
+    fn from_env() -> Result<Self> {
+        let mut limits = Self::default();
+        match std::env::var(PARTITION_WINDOW_BYTES_ENV) {
+            Ok(value) => {
+                limits.window_bytes = value
+                    .trim()
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|bytes| *bytes > 0)
+                    .ok_or_else(|| {
+                        Error::invalid_input(format!(
+                            "{PARTITION_WINDOW_BYTES_ENV} must be a positive integer number of bytes, got {value:?}"
+                        ))
+                    })?;
+            }
+            Err(std::env::VarError::NotPresent) => {}
+            Err(std::env::VarError::NotUnicode(value)) => {
+                return Err(Error::invalid_input(format!(
+                    "{PARTITION_WINDOW_BYTES_ENV} must contain a UTF-8 integer number of bytes, got {value:?}"
+                )));
+            }
+        }
+        Ok(limits)
     }
 }
 
@@ -1384,7 +1416,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 sub_index_params,
                 column,
                 frag_reuse_index,
-                FreshPartitionBuildLimits::default(),
+                FreshPartitionBuildLimits::from_env()?,
                 self.partition_build_times.clone(),
             );
         }

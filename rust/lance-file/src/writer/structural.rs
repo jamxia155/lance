@@ -2,7 +2,14 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use core::panic;
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 use arrow_array::{Array, ArrayRef, RecordBatch, StructArray, make_array};
 use arrow_buffer::BooleanBuffer;
@@ -37,6 +44,53 @@ use crate::{
         PAGE_BUFFER_ALIGNMENT,
     },
 };
+
+static SCHEDULE_NANOS: AtomicU64 = AtomicU64::new(0);
+static ENCODE_WAIT_NANOS: AtomicU64 = AtomicU64::new(0);
+static PAGE_WRITE_NANOS: AtomicU64 = AtomicU64::new(0);
+static FLUSH_NANOS: AtomicU64 = AtomicU64::new(0);
+
+/// Where `write_batch` spends its time, summed over every v2.1+ writer in the
+/// process since the last [`reset_write_timings`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WriteTimings {
+    /// Scheduling the encode tasks, plus any out-of-line buffers written first.
+    pub schedule: Duration,
+    /// Waiting for encode tasks to finish. This includes time queued behind
+    /// other work on the CPU pool.
+    pub encode_wait: Duration,
+    /// Writing encoded pages to the object writer, including backpressure.
+    pub page_write: Duration,
+    /// Reaping failed uploads after a batch.
+    pub flush: Duration,
+}
+
+/// Snapshot of the process-wide write timings.
+pub fn write_timings() -> WriteTimings {
+    let load = |nanos: &AtomicU64| Duration::from_nanos(nanos.load(Ordering::Relaxed));
+    WriteTimings {
+        schedule: load(&SCHEDULE_NANOS),
+        encode_wait: load(&ENCODE_WAIT_NANOS),
+        page_write: load(&PAGE_WRITE_NANOS),
+        flush: load(&FLUSH_NANOS),
+    }
+}
+
+/// Zero the process-wide write timings.
+pub fn reset_write_timings() {
+    for nanos in [
+        &SCHEDULE_NANOS,
+        &ENCODE_WAIT_NANOS,
+        &PAGE_WRITE_NANOS,
+        &FLUSH_NANOS,
+    ] {
+        nanos.store(0, Ordering::Relaxed);
+    }
+}
+
+fn add_nanos(nanos: &AtomicU64, start: Instant) {
+    nanos.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+}
 
 const PAD_BUFFER: [u8; PAGE_BUFFER_ALIGNMENT] = [72; PAGE_BUFFER_ALIGNMENT];
 
@@ -249,13 +303,22 @@ impl StructuralFileSink {
         &mut self,
         mut encoding_tasks: FuturesOrdered<EncodeTask>,
     ) -> Result<()> {
-        while let Some(encoding_task) = encoding_tasks.next().await {
+        loop {
+            let wait_start = Instant::now();
+            let Some(encoding_task) = encoding_tasks.next().await else {
+                break;
+            };
+            add_nanos(&ENCODE_WAIT_NANOS, wait_start);
+            let write_start = Instant::now();
             self.write_page(encoding_task?).await?;
+            add_nanos(&PAGE_WRITE_NANOS, write_start);
         }
         // Reaps any upload that has already failed so the error is attributed to
         // this batch. This does not wait for in-flight uploads; see
         // `ObjectWriter::poll_flush`.
+        let flush_start = Instant::now();
         self.writer.flush().await?;
+        add_nanos(&FLUSH_NANOS, flush_start);
         Ok(())
     }
 
@@ -625,6 +688,7 @@ impl EncodingPipeline {
             ));
         }
 
+        let schedule_start = Instant::now();
         let mut external_buffers =
             OutOfLineBuffers::new(sink.tell().await?, PAGE_BUFFER_ALIGNMENT as u64);
         let encoding_tasks = self.encode_batch(batch, &mut external_buffers)?;
@@ -635,6 +699,7 @@ impl EncodingPipeline {
             .into_iter()
             .flatten()
             .collect::<FuturesOrdered<_>>();
+        add_nanos(&SCHEDULE_NANOS, schedule_start);
 
         if self.rows_written.checked_add(num_rows).is_none() {
             return Err(Error::invalid_input_source(format!(

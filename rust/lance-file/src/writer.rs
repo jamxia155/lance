@@ -19,6 +19,7 @@ pub(crate) mod structural;
 
 pub(crate) use field_types::ExpectedTypes;
 pub use field_types::FieldTypeMismatch;
+pub use structural::{WriteTimings, reset_write_timings, write_timings};
 
 /// Page buffers in current Lance files are aligned to 64 bytes.
 pub(crate) const PAGE_BUFFER_ALIGNMENT: usize = 64;

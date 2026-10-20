@@ -1932,6 +1932,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let mut partition_index_metadata = Vec::with_capacity(ivf.num_partitions());
 
         let num_partitions = ivf.num_partitions();
+        lance_file::writer::reset_write_timings();
         let mut ordered_results = OrderedPartitionResults::new(num_partitions);
         let mut total_loss = 0.0;
         let mut storage_batches_time = Duration::default();
@@ -2174,6 +2175,17 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         eprintln!(
             "lance vector merge_partitions windows: {}",
             self.partition_build_times.window_summary(),
+        );
+
+        // Summed over every writer in the process, so it also covers the index
+        // file writer; merge_partitions is the only writer user at this point.
+        let write_timings = lance_file::writer::write_timings();
+        eprintln!(
+            "lance vector merge_partitions write_batch breakdown: schedule_s={:.3} encode_wait_s={:.3} page_write_s={:.3} flush_s={:.3}",
+            write_timings.schedule.as_secs_f64(),
+            write_timings.encode_wait.as_secs_f64(),
+            write_timings.page_write.as_secs_f64(),
+            write_timings.flush.as_secs_f64(),
         );
 
         log::info!("merging {} partitions done", ivf.num_partitions());

@@ -69,6 +69,8 @@ struct AlignedBuf {
     layout: Layout,
     /// Bytes written so far; only this prefix is exposed through `AsRef`.
     filled: usize,
+    /// Set when the memory came from a registered pool (see `buffer_pool`).
+    release: Option<Box<dyn FnOnce() + Send + Sync>>,
 }
 
 // SAFETY: `AlignedBuf` exclusively owns its allocation; nothing else aliases
@@ -82,6 +84,14 @@ impl AlignedBuf {
             .map_err(|err| std::io::Error::new(ErrorKind::InvalidInput, err))?;
         // `len` is non-zero: callers return early for empty ranges.
         debug_assert!(len > 0);
+        if let Some(pooled) = crate::buffer_pool::try_alloc(len) {
+            return Ok(Self {
+                ptr: pooled.ptr,
+                layout,
+                filled: 0,
+                release: Some(pooled.release),
+            });
+        }
         // SAFETY: `layout` has a non-zero size.
         let ptr = unsafe { alloc(layout) };
         let ptr = NonNull::new(ptr).ok_or_else(|| {
@@ -94,6 +104,7 @@ impl AlignedBuf {
             ptr,
             layout,
             filled: 0,
+            release: None,
         })
     }
 
@@ -121,6 +132,10 @@ impl AsRef<[u8]> for AlignedBuf {
 
 impl Drop for AlignedBuf {
     fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            release();
+            return;
+        }
         // SAFETY: allocated in `new` with this layout.
         unsafe { dealloc(self.ptr.as_ptr(), self.layout) };
     }

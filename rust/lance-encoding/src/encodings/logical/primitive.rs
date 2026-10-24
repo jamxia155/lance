@@ -5192,7 +5192,7 @@ impl StructuralDecodeArrayTask for StructuralCompositeDecodeArrayTask {
         }
         let array_refs = arrays.iter().map(|arr| arr.as_ref()).collect::<Vec<_>>();
         let array = match arrays.len() > 1 {
-            true => crate::output_pool::try_pooled_concat(&arrays, &self.data_type),
+            true => crate::output_pool::try_pooled_concat(&arrays),
             false => None,
         };
         let array = match array {

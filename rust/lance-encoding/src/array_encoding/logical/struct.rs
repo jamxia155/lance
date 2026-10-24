@@ -635,6 +635,14 @@ impl CompositeDecodeTask {
         //
         // This optimization is probably most important for super fast storage like NVME
         // where the page size can be smaller.
+        //
+        // A host can supply the destination buffer for large fixed-size-list batches, see
+        // `crate::output_pool`.
+        if arrays.len() > 1 {
+            if let Some(array) = crate::output_pool::try_pooled_concat(&arrays) {
+                return Ok(array);
+            }
+        }
         Ok(arrow_select::concat::concat(&array_refs)?)
     }
 }

@@ -58,10 +58,10 @@ impl Drop for PooledOwner {
 
 /// Concatenates `arrays` into a buffer from the installed allocator, or returns `None` if no
 /// allocator is installed, the type or nulls are unsupported, or the allocator declines.
-pub(crate) fn try_pooled_concat(arrays: &[ArrayRef], data_type: &DataType) -> Option<ArrayRef> {
+pub(crate) fn try_pooled_concat(arrays: &[ArrayRef]) -> Option<ArrayRef> {
     // Small batches are not worth pooling.
     const MIN_BYTES: usize = 1 << 20;
-    let DataType::FixedSizeList(child_field, dimension) = data_type else {
+    let DataType::FixedSizeList(child_field, dimension) = arrays.first()?.data_type() else {
         return None;
     };
     if child_field.data_type() != &DataType::Float32 || *dimension <= 0 {
@@ -173,8 +173,7 @@ mod tests {
         // A sliced array exercises the window handling.
         let b = fsl(1.0e6, 2500, dim).slice(100, 2000);
         let arrays = vec![a, b];
-        let data_type = arrays[0].data_type().clone();
-        let pooled = try_pooled_concat(&arrays, &data_type).expect("pooled");
+        let pooled = try_pooled_concat(&arrays).expect("pooled");
         set_decode_output_allocator(None);
 
         let refs = arrays.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
@@ -188,6 +187,6 @@ mod tests {
     #[test]
     fn declines_other_types() {
         let ints: ArrayRef = Arc::new(arrow_array::Int32Array::from(vec![1, 2, 3]));
-        assert!(try_pooled_concat(&[ints.clone(), ints], &DataType::Int32).is_none());
+        assert!(try_pooled_concat(&[ints.clone(), ints]).is_none());
     }
 }

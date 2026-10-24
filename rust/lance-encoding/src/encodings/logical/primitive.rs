@@ -5191,7 +5191,14 @@ impl StructuralDecodeArrayTask for StructuralCompositeDecodeArrayTask {
             arrays.push(array);
         }
         let array_refs = arrays.iter().map(|arr| arr.as_ref()).collect::<Vec<_>>();
-        let array = arrow_select::concat::concat(&array_refs)?;
+        let array = match arrays.len() > 1 {
+            true => crate::output_pool::try_pooled_concat(&arrays, &self.data_type),
+            false => None,
+        };
+        let array = match array {
+            Some(array) => array,
+            None => arrow_select::concat::concat(&array_refs)?,
+        };
         let mut repdef = CompositeRepDefUnraveler::new(unravelers);
 
         let array = Self::restore_validity(array, &mut repdef)?;

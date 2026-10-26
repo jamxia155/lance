@@ -105,6 +105,20 @@ impl BucketBuffer {
     }
 }
 
+/// Number of flush jobs that can queue in front of each flush worker. Each job holds one bucket
+/// buffer (32K rows, about 9 MB for 256-byte codes), which bounds the memory in flight.
+const PARTITION_ARTIFACT_FLUSH_QUEUE_PER_WORKER: usize = 4;
+const PARTITION_ARTIFACT_FLUSH_WORKERS_DEFAULT: usize = 8;
+
+/// Number of tasks that sort, encode and write full bucket buffers, from
+/// `LANCE_PARTITION_ARTIFACT_FLUSH_WORKERS`. `0` flushes inline on the appending task.
+fn partition_artifact_flush_workers() -> usize {
+    std::env::var("LANCE_PARTITION_ARTIFACT_FLUSH_WORKERS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(PARTITION_ARTIFACT_FLUSH_WORKERS_DEFAULT)
+}
+
 #[derive(Default, Debug)]
 struct PartitionArtifactBuilderStats {
     append_batches: usize,
@@ -113,6 +127,16 @@ struct PartitionArtifactBuilderStats {
     validate_time: Duration,
     extract_time: Duration,
     scatter_time: Duration,
+    /// Time the appending task spent handing full buffers to the flush (including waiting for a
+    /// worker's queue to drain); with inline flushing this contains the whole flush.
+    dispatch_time: Duration,
+    finish_flush_time: Duration,
+    manifest_time: Duration,
+}
+
+/// Counters of the flush itself. With flush workers, times are summed over the workers.
+#[derive(Default, Debug)]
+struct FlushStats {
     flushes: usize,
     flushed_rows: usize,
     single_partition_flushes: usize,
@@ -120,9 +144,333 @@ struct PartitionArtifactBuilderStats {
     flush_time: Duration,
     final_batch_time: Duration,
     writer_time: Duration,
-    finish_flush_time: Duration,
     writer_finish_time: Duration,
-    manifest_time: Duration,
+}
+
+impl FlushStats {
+    fn add(&mut self, other: &FlushStats) {
+        self.flushes += other.flushes;
+        self.flushed_rows += other.flushed_rows;
+        self.single_partition_flushes += other.single_partition_flushes;
+        self.multi_partition_flushes += other.multi_partition_flushes;
+        self.flush_time += other.flush_time;
+        self.final_batch_time += other.final_batch_time;
+        self.writer_time += other.writer_time;
+        self.writer_finish_time += other.writer_finish_time;
+    }
+}
+
+/// What a flush needs to know about the artifact.
+#[derive(Debug)]
+struct FlushContext {
+    object_store: Arc<ObjectStore>,
+    root_dir: Path,
+    num_partitions: usize,
+    num_buckets: usize,
+    pq_code_width: usize,
+    final_schema: Arc<ArrowSchema>,
+}
+
+impl FlushContext {
+    /// Path of the finalized file for one bucket.
+    fn final_bucket_path(&self, bucket_id: usize) -> Path {
+        self.root_dir
+            .clone()
+            .join(PARTITION_ARTIFACT_PARTITIONS_DIR)
+            .join(format!(
+                "{PARTITION_ARTIFACT_BUCKET_PREFIX}{bucket_id:05}.lance"
+            ))
+    }
+
+    /// Relative path recorded in the manifest for one finalized bucket.
+    fn final_bucket_relative_path(&self, bucket_id: usize) -> String {
+        format!(
+            "{PARTITION_ARTIFACT_PARTITIONS_DIR}/{PARTITION_ARTIFACT_BUCKET_PREFIX}{bucket_id:05}.lance"
+        )
+    }
+}
+
+/// One full bucket buffer on its way to the bucket file.
+struct FlushJob {
+    bucket_id: usize,
+    /// Row index in the bucket file where this job's rows start. Assigned in dispatch order, so
+    /// it does not depend on when the job is written.
+    file_offset: u64,
+    row_ids: Vec<u64>,
+    part_ids: Vec<u32>,
+    pq_values: Vec<u8>,
+}
+
+/// Everything a flush produces for the buckets it owns.
+#[derive(Debug, Default)]
+struct FlushOutput {
+    /// Manifest entries of the partitions that received rows.
+    partitions: Vec<(usize, PartitionArtifactPartition)>,
+    /// Buckets that have a file.
+    buckets: Vec<usize>,
+    stats: FlushStats,
+}
+
+/// Sorts, encodes and writes full bucket buffers. It owns the writers and manifest entries of
+/// its buckets: every partition lives in exactly one bucket, so a bucket's flushes only touch
+/// state that is private to the state that owns it. A bucket's jobs must reach it in order.
+struct FlushState {
+    ctx: Arc<FlushContext>,
+    writers: HashMap<usize, FileWriter>,
+    partitions: HashMap<usize, PartitionArtifactPartition>,
+    stats: FlushStats,
+}
+
+impl FlushState {
+    fn new(ctx: Arc<FlushContext>) -> Self {
+        Self {
+            ctx,
+            writers: HashMap::new(),
+            partitions: HashMap::new(),
+            stats: FlushStats::default(),
+        }
+    }
+
+    fn partition_entry(&mut self, partition_id: usize) -> &mut PartitionArtifactPartition {
+        self.partitions
+            .entry(partition_id)
+            .or_insert_with(|| PartitionArtifactPartition {
+                path: None,
+                num_rows: 0,
+                ranges: Vec::new(),
+            })
+    }
+
+    /// Flush one bucket buffer into its finalized bucket file.
+    ///
+    /// Each flush sorts only the buffered rows for this bucket and appends them
+    /// to the final file while recording new manifest ranges for the affected
+    /// partitions.
+    async fn process(&mut self, job: FlushJob) -> Result<()> {
+        let flush_start = Instant::now();
+        let FlushJob {
+            bucket_id,
+            file_offset,
+            row_ids,
+            part_ids,
+            pq_values,
+        } = job;
+        let total_rows = row_ids.len();
+        self.stats.flushes += 1;
+        self.stats.flushed_rows += total_rows;
+
+        let result = if self.ctx.num_buckets == self.ctx.num_partitions {
+            debug_assert!(part_ids.is_empty());
+            self.stats.single_partition_flushes += 1;
+            self.flush_single_partition_bucket(
+                bucket_id,
+                file_offset,
+                row_ids,
+                pq_values,
+                total_rows,
+            )
+            .await
+        } else {
+            self.stats.multi_partition_flushes += 1;
+
+            let row_ids = UInt64Array::from(row_ids);
+            let pq_values = UInt8Array::from(pq_values);
+            let pq_code_width = self.ctx.pq_code_width;
+            let mut permutation = (0..total_rows).collect::<Vec<_>>();
+            permutation.sort_unstable_by_key(|&idx| part_ids[idx]);
+
+            let mut sorted_row_ids = Vec::with_capacity(total_rows);
+            let mut sorted_partition_ids = Vec::with_capacity(total_rows);
+            let mut sorted_pq_values = Vec::with_capacity(total_rows * pq_code_width);
+            for idx in permutation {
+                sorted_row_ids.push(row_ids.value(idx));
+                sorted_partition_ids.push(part_ids[idx]);
+                let start = idx * pq_code_width;
+                let end = start + pq_code_width;
+                sorted_pq_values.extend_from_slice(&pq_values.values()[start..end]);
+            }
+
+            let final_relative_path = self.ctx.final_bucket_relative_path(bucket_id);
+            let mut offset = 0usize;
+            while offset < sorted_partition_ids.len() {
+                let partition_id = sorted_partition_ids[offset] as usize;
+                let mut end = offset + 1;
+                while end < sorted_partition_ids.len()
+                    && sorted_partition_ids[end] == sorted_partition_ids[offset]
+                {
+                    end += 1;
+                }
+                let partition = self.partition_entry(partition_id);
+                match &partition.path {
+                    Some(existing) if existing != &final_relative_path => {
+                        return Err(Error::io(format!(
+                            "partition {} is split across multiple bucket files: '{}' vs '{}'",
+                            partition_id, existing, final_relative_path
+                        )));
+                    }
+                    None => partition.path = Some(final_relative_path.clone()),
+                    _ => {}
+                }
+                partition.num_rows += end - offset;
+                append_partition_range(
+                    partition,
+                    file_offset + offset as u64,
+                    (end - offset) as u64,
+                );
+                offset = end;
+            }
+
+            let pq_codes = FixedSizeListArray::try_new_from_values(
+                UInt8Array::from(sorted_pq_values),
+                pq_code_width as i32,
+            )?;
+            self.write_bucket_batch(
+                bucket_id,
+                UInt64Array::from(sorted_row_ids),
+                pq_codes,
+                total_rows,
+            )
+            .await
+        };
+        self.stats.flush_time += flush_start.elapsed();
+        result
+    }
+
+    /// Flush a bucket that maps exactly to one partition.
+    ///
+    /// When the number of buckets equals the number of partitions, all rows in
+    /// one bucket already belong to the same partition. Sorting by partition id
+    /// would only add CPU work and another PQ-code copy.
+    async fn flush_single_partition_bucket(
+        &mut self,
+        bucket_id: usize,
+        file_offset: u64,
+        row_ids: Vec<u64>,
+        pq_values: Vec<u8>,
+        total_rows: usize,
+    ) -> Result<()> {
+        let final_relative_path = self.ctx.final_bucket_relative_path(bucket_id);
+        let partition = self.partition_entry(bucket_id);
+        match &partition.path {
+            Some(existing) if existing != &final_relative_path => {
+                return Err(Error::io(format!(
+                    "partition {} is split across multiple bucket files: '{}' vs '{}'",
+                    bucket_id, existing, final_relative_path
+                )));
+            }
+            None => partition.path = Some(final_relative_path),
+            _ => {}
+        }
+        partition.num_rows += total_rows;
+        append_partition_range(partition, file_offset, total_rows as u64);
+
+        let pq_codes = FixedSizeListArray::try_new_from_values(
+            UInt8Array::from(pq_values),
+            self.ctx.pq_code_width as i32,
+        )?;
+        self.write_bucket_batch(bucket_id, UInt64Array::from(row_ids), pq_codes, total_rows)
+            .await
+    }
+
+    /// Write a finalized bucket batch.
+    async fn write_bucket_batch(
+        &mut self,
+        bucket_id: usize,
+        row_ids: UInt64Array,
+        pq_codes: FixedSizeListArray,
+        _total_rows: usize,
+    ) -> Result<()> {
+        let final_batch_start = Instant::now();
+        let final_batch = RecordBatch::try_new(
+            self.ctx.final_schema.clone(),
+            vec![Arc::new(row_ids), Arc::new(pq_codes)],
+        )?;
+        self.stats.final_batch_time += final_batch_start.elapsed();
+
+        let writer_start = Instant::now();
+        {
+            let writer = self.ensure_final_writer(bucket_id).await?;
+            writer.write_batch(&final_batch).await?;
+        }
+        self.stats.writer_time += writer_start.elapsed();
+        Ok(())
+    }
+
+    /// Lazily create the finalized writer for a bucket.
+    ///
+    /// Buckets that never receive rows never create a file, which keeps sparse
+    /// artifacts compact.
+    async fn ensure_final_writer(&mut self, bucket_id: usize) -> Result<&mut FileWriter> {
+        if !self.writers.contains_key(&bucket_id) {
+            let path = self.ctx.final_bucket_path(bucket_id);
+            let writer = file_versions::create_writer(
+                partition_artifact_file_version()?,
+                self.ctx.object_store.create(&path).await?,
+                Schema::try_from(self.ctx.final_schema.as_ref())?,
+                FileWriterOptions::default(),
+            )?;
+            self.writers.insert(bucket_id, writer);
+        }
+        Ok(self
+            .writers
+            .get_mut(&bucket_id)
+            .expect("final writer initialized"))
+    }
+
+    /// Finish the bucket files and hand back what this state wrote.
+    async fn finish(mut self) -> Result<FlushOutput> {
+        let writer_finish_start = Instant::now();
+        let mut buckets = Vec::with_capacity(self.writers.len());
+        for (bucket_id, writer) in self.writers.iter_mut() {
+            writer.finish().await?;
+            buckets.push(*bucket_id);
+        }
+        self.stats.writer_finish_time += writer_finish_start.elapsed();
+        Ok(FlushOutput {
+            partitions: self.partitions.into_iter().collect(),
+            buckets,
+            stats: self.stats,
+        })
+    }
+}
+
+/// Where full bucket buffers go.
+enum FlushSink {
+    /// Not started yet; the first flush starts it (spawning needs a runtime).
+    Unstarted,
+    /// Flushed on the appending task.
+    Inline(Box<FlushState>),
+    /// Flushed by worker tasks; bucket `b` is owned by worker `b % workers`.
+    Workers {
+        senders: Vec<tokio::sync::mpsc::Sender<FlushJob>>,
+        handles: Vec<tokio::task::JoinHandle<Result<FlushOutput>>>,
+    },
+    Finished,
+}
+
+/// Waits for the flush workers and returns their outputs, or the first error.
+async fn join_flush_workers(
+    handles: Vec<tokio::task::JoinHandle<Result<FlushOutput>>>,
+) -> Result<Vec<FlushOutput>> {
+    let mut outputs = Vec::with_capacity(handles.len());
+    let mut first_error = None;
+    for handle in handles {
+        match handle.await {
+            Ok(Ok(output)) => outputs.push(output),
+            Ok(Err(error)) => {
+                first_error.get_or_insert(error);
+            }
+            Err(join_error) => {
+                first_error.get_or_insert(Error::io(format!(
+                    "partition artifact flush worker failed: {join_error}"
+                )));
+            }
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(outputs),
+    }
 }
 
 /// Writes partition-addressable encoded rows for a later Lance finalization.
@@ -132,18 +480,20 @@ struct PartitionArtifactBuilderStats {
 /// the finalized bucket file, while the manifest accumulates per-partition row
 /// ranges. This keeps the writer streaming and avoids a full read/sort/rewrite
 /// pass at `finish()` time.
+///
+/// The flush (sort, encode, write) runs on `LANCE_PARTITION_ARTIFACT_FLUSH_WORKERS` tasks
+/// (default 8; 0 runs it inline on the task that appends), so the appending task only scatters
+/// rows into buffers. Buckets are independent files, and each is owned by one worker, so the
+/// files and the manifest are the same as with inline flushing.
 pub struct PartitionArtifactBuilder {
-    object_store: Arc<ObjectStore>,
-    root_dir: Path,
-    num_partitions: usize,
-    num_buckets: usize,
-    pq_code_width: usize,
-    final_schema: Arc<ArrowSchema>,
-    final_writers: Vec<Option<FileWriter>>,
+    ctx: Arc<FlushContext>,
     buffers: Vec<BucketBuffer>,
-    partitions: Vec<PartitionArtifactPartition>,
+    /// Rows handed to the flush so far per bucket, which is where the next flush starts.
     bucket_row_counts: Vec<u64>,
+    flush_workers: usize,
+    sink: FlushSink,
     stats: PartitionArtifactBuilderStats,
+    flush_stats: FlushStats,
 }
 
 impl PartitionArtifactBuilder {
@@ -215,24 +565,20 @@ impl PartitionArtifactBuilder {
         ]));
 
         Ok(Self {
-            object_store,
-            root_dir,
-            num_partitions,
-            num_buckets,
-            pq_code_width,
-            final_schema,
-            final_writers: (0..num_buckets).map(|_| None).collect(),
+            ctx: Arc::new(FlushContext {
+                object_store,
+                root_dir,
+                num_partitions,
+                num_buckets,
+                pq_code_width,
+                final_schema,
+            }),
             buffers: (0..num_buckets).map(|_| BucketBuffer::default()).collect(),
-            partitions: vec![
-                PartitionArtifactPartition {
-                    path: None,
-                    num_rows: 0,
-                    ranges: Vec::new(),
-                };
-                num_partitions
-            ],
             bucket_row_counts: vec![0; num_buckets],
+            flush_workers: partition_artifact_flush_workers().min(num_buckets),
+            sink: FlushSink::Unstarted,
             stats: PartitionArtifactBuilderStats::default(),
+            flush_stats: FlushStats::default(),
         })
     }
 
@@ -244,7 +590,7 @@ impl PartitionArtifactBuilder {
     pub async fn append_batch(&mut self, batch: &RecordBatch) -> Result<()> {
         let append_start = Instant::now();
         let validate_start = Instant::now();
-        validate_input_batch(batch, self.pq_code_width)?;
+        validate_input_batch(batch, self.ctx.pq_code_width)?;
         self.stats.validate_time += validate_start.elapsed();
 
         let extract_start = Instant::now();
@@ -257,26 +603,31 @@ impl PartitionArtifactBuilder {
         let pq_values = pq_values.values().as_ref();
         self.stats.extract_time += extract_start.elapsed();
 
+        let num_partitions = self.ctx.num_partitions;
+        let num_buckets = self.ctx.num_buckets;
+        let pq_code_width = self.ctx.pq_code_width;
         let scatter_start = Instant::now();
         for row_idx in 0..batch.num_rows() {
             let partition_id = part_ids.value(row_idx) as usize;
-            if partition_id >= self.num_partitions {
+            if partition_id >= num_partitions {
                 return Err(Error::invalid_input(format!(
                     "partition artifact batch contains partition id {} but num_partitions is {}",
-                    partition_id, self.num_partitions
+                    partition_id, num_partitions
                 )));
             }
-            let bucket_id = partition_id % self.num_buckets;
+            let bucket_id = partition_id % num_buckets;
             let buffer = &mut self.buffers[bucket_id];
             buffer.row_ids.push(row_ids.value(row_idx));
-            if self.num_buckets != self.num_partitions {
+            if num_buckets != num_partitions {
                 buffer.partition_ids.push(partition_id as u32);
             }
-            let start = row_idx * self.pq_code_width;
-            let end = start + self.pq_code_width;
+            let start = row_idx * pq_code_width;
+            let end = start + pq_code_width;
             buffer.pq_values.extend_from_slice(&pq_values[start..end]);
             if buffer.len() >= PARTITION_ARTIFACT_BUCKET_BUFFER_ROWS {
+                let dispatch_start = Instant::now();
                 self.flush_bucket(bucket_id).await?;
+                self.stats.dispatch_time += dispatch_start.elapsed();
             }
         }
         self.stats.scatter_time += scatter_start.elapsed();
@@ -288,6 +639,7 @@ impl PartitionArtifactBuilder {
 
     /// Finalize the artifact and return the relative files that were created.
     ///
+    /// bucket file.
     /// Finalization only needs to flush the remaining in-memory buffers and
     /// persist the manifest because bucket files are already in their final
     /// layout.
@@ -297,36 +649,59 @@ impl PartitionArtifactBuilder {
         total_loss: Option<f64>,
     ) -> Result<Vec<String>> {
         let finish_flush_start = Instant::now();
-        for bucket_id in 0..self.num_buckets {
+        for bucket_id in 0..self.ctx.num_buckets {
             self.flush_bucket(bucket_id).await?;
         }
+        let outputs = match mem::replace(&mut self.sink, FlushSink::Finished) {
+            FlushSink::Unstarted => vec![FlushState::new(self.ctx.clone()).finish().await?],
+            FlushSink::Inline(state) => vec![state.finish().await?],
+            FlushSink::Workers { senders, handles } => {
+                // Closing the queues lets each worker drain its jobs and finish its files.
+                drop(senders);
+                join_flush_workers(handles).await?
+            }
+            FlushSink::Finished => {
+                return Err(Error::invalid_input(
+                    "partition artifact builder is already finished".to_string(),
+                ));
+            }
+        };
         self.stats.finish_flush_time += finish_flush_start.elapsed();
-        let writer_finish_start = Instant::now();
-        for writer in self.final_writers.iter_mut() {
-            if let Some(writer) = writer.as_mut() {
-                writer.finish().await?;
-            }
-        }
-        self.stats.writer_finish_time += writer_finish_start.elapsed();
 
-        let mut artifact_files = Vec::with_capacity(self.num_buckets + 1);
-        for bucket_id in 0..self.num_buckets {
-            if self.final_writers[bucket_id].is_some() {
-                artifact_files.push(self.final_bucket_relative_path(bucket_id));
+        let mut partitions = vec![
+            PartitionArtifactPartition {
+                path: None,
+                num_rows: 0,
+                ranges: Vec::new(),
+            };
+            self.ctx.num_partitions
+        ];
+        let mut buckets = Vec::new();
+        for output in outputs {
+            for (partition_id, partition) in output.partitions {
+                partitions[partition_id] = partition;
             }
+            buckets.extend(output.buckets);
+            self.flush_stats.add(&output.stats);
         }
+        buckets.sort_unstable();
+        let artifact_files = buckets
+            .iter()
+            .map(|&bucket_id| self.ctx.final_bucket_relative_path(bucket_id))
+            .collect::<Vec<_>>();
 
         let manifest = PartitionArtifactManifest {
             version: PARTITION_ARTIFACT_MANIFEST_VERSION,
-            num_partitions: self.num_partitions,
+            num_partitions: self.ctx.num_partitions,
             metadata_file: Some(metadata_file.to_string()),
             total_loss,
-            partitions: self.partitions.clone(),
+            partitions,
         };
         let manifest_start = Instant::now();
         write_json(
-            self.object_store.as_ref(),
+            self.ctx.object_store.as_ref(),
             &self
+                .ctx
                 .root_dir
                 .clone()
                 .join(PARTITION_ARTIFACT_MANIFEST_FILE_NAME),
@@ -341,214 +716,103 @@ impl PartitionArtifactBuilder {
         Ok(files)
     }
 
-    /// Flush the current in-memory buffer for one bucket into its finalized
-    /// bucket file.
-    ///
-    /// Each flush sorts only the buffered rows for this bucket and appends them
-    /// to the final file while recording new manifest ranges for the affected
-    /// partitions.
+    #[cfg(test)]
+    fn with_flush_workers(mut self, workers: usize) -> Self {
+        self.flush_workers = workers.min(self.ctx.num_buckets);
+        self
+    }
+
+    /// Start the flush on first use.
+    fn start_sink(&mut self) {
+        if !matches!(self.sink, FlushSink::Unstarted) {
+            return;
+        }
+        if self.flush_workers == 0 {
+            self.sink = FlushSink::Inline(Box::new(FlushState::new(self.ctx.clone())));
+            return;
+        }
+        let mut senders = Vec::with_capacity(self.flush_workers);
+        let mut handles = Vec::with_capacity(self.flush_workers);
+        for _ in 0..self.flush_workers {
+            let (tx, mut rx) =
+                tokio::sync::mpsc::channel::<FlushJob>(PARTITION_ARTIFACT_FLUSH_QUEUE_PER_WORKER);
+            let mut state = FlushState::new(self.ctx.clone());
+            handles.push(tokio::spawn(async move {
+                while let Some(job) = rx.recv().await {
+                    state.process(job).await?;
+                }
+                state.finish().await
+            }));
+            senders.push(tx);
+        }
+        self.sink = FlushSink::Workers { senders, handles };
+    }
+
+    /// Hand the current in-memory buffer of one bucket to the flush.
     async fn flush_bucket(&mut self, bucket_id: usize) -> Result<()> {
         if self.buffers[bucket_id].is_empty() {
             return Ok(());
         }
-        let flush_start = Instant::now();
+        self.start_sink();
 
         let buffer = &mut self.buffers[bucket_id];
         let row_ids = mem::take(&mut buffer.row_ids);
-        let part_ids = mem::take(&mut buffer.partition_ids);
-        let pq_values = mem::take(&mut buffer.pq_values);
-        let total_rows = row_ids.len();
-        self.stats.flushes += 1;
-        self.stats.flushed_rows += total_rows;
-
-        let result = if self.num_buckets == self.num_partitions {
-            debug_assert!(part_ids.is_empty());
-            self.stats.single_partition_flushes += 1;
-            self.flush_single_partition_bucket(bucket_id, row_ids, pq_values, total_rows)
-                .await
-        } else {
-            self.stats.multi_partition_flushes += 1;
-
-            let row_ids = UInt64Array::from(row_ids);
-            let pq_values = UInt8Array::from(pq_values);
-            let mut permutation = (0..total_rows).collect::<Vec<_>>();
-            permutation.sort_unstable_by_key(|&idx| part_ids[idx]);
-
-            let mut sorted_row_ids = Vec::with_capacity(total_rows);
-            let mut sorted_partition_ids = Vec::with_capacity(total_rows);
-            let mut sorted_pq_values = Vec::with_capacity(total_rows * self.pq_code_width);
-            for idx in permutation {
-                sorted_row_ids.push(row_ids.value(idx));
-                sorted_partition_ids.push(part_ids[idx]);
-                let start = idx * self.pq_code_width;
-                let end = start + self.pq_code_width;
-                sorted_pq_values.extend_from_slice(&pq_values.values()[start..end]);
-            }
-
-            let file_offset = self.bucket_row_counts[bucket_id];
-            let final_relative_path = self.final_bucket_relative_path(bucket_id);
-            let mut offset = 0usize;
-            while offset < sorted_partition_ids.len() {
-                let partition_id = sorted_partition_ids[offset] as usize;
-                let mut end = offset + 1;
-                while end < sorted_partition_ids.len()
-                    && sorted_partition_ids[end] == sorted_partition_ids[offset]
-                {
-                    end += 1;
-                }
-                let partition = &mut self.partitions[partition_id];
-                match &partition.path {
-                    Some(existing) if existing != &final_relative_path => {
-                        return Err(Error::io(format!(
-                            "partition {} is split across multiple bucket files: '{}' vs '{}'",
-                            partition_id, existing, final_relative_path
-                        )));
-                    }
-                    None => partition.path = Some(final_relative_path.clone()),
-                    _ => {}
-                }
-                partition.num_rows += end - offset;
-                append_partition_range(
-                    partition,
-                    file_offset + offset as u64,
-                    (end - offset) as u64,
-                );
-                offset = end;
-            }
-
-            let pq_codes = FixedSizeListArray::try_new_from_values(
-                UInt8Array::from(sorted_pq_values),
-                self.pq_code_width as i32,
-            )?;
-            self.write_bucket_batch(
-                bucket_id,
-                UInt64Array::from(sorted_row_ids),
-                pq_codes,
-                total_rows,
-            )
-            .await
+        let job = FlushJob {
+            bucket_id,
+            file_offset: self.bucket_row_counts[bucket_id],
+            part_ids: mem::take(&mut buffer.partition_ids),
+            pq_values: mem::take(&mut buffer.pq_values),
+            row_ids,
         };
-        self.stats.flush_time += flush_start.elapsed();
-        result
-    }
+        self.bucket_row_counts[bucket_id] += job.row_ids.len() as u64;
 
-    /// Flush a bucket that maps exactly to one partition.
-    ///
-    /// When the number of buckets equals the number of partitions, all rows in
-    /// one bucket already belong to the same partition. Sorting by partition id
-    /// would only add CPU work and another PQ-code copy.
-    async fn flush_single_partition_bucket(
-        &mut self,
-        bucket_id: usize,
-        row_ids: Vec<u64>,
-        pq_values: Vec<u8>,
-        total_rows: usize,
-    ) -> Result<()> {
-        let file_offset = self.bucket_row_counts[bucket_id];
-        let final_relative_path = self.final_bucket_relative_path(bucket_id);
-        let partition = &mut self.partitions[bucket_id];
-        match &partition.path {
-            Some(existing) if existing != &final_relative_path => {
-                return Err(Error::io(format!(
-                    "partition {} is split across multiple bucket files: '{}' vs '{}'",
-                    bucket_id, existing, final_relative_path
-                )));
+        match &mut self.sink {
+            FlushSink::Inline(state) => state.process(job).await,
+            FlushSink::Workers { senders, .. } => {
+                let worker = bucket_id % senders.len();
+                if senders[worker].send(job).await.is_ok() {
+                    return Ok(());
+                }
+                // The worker stopped; its error says why.
+                let FlushSink::Workers { senders, handles } =
+                    mem::replace(&mut self.sink, FlushSink::Finished)
+                else {
+                    unreachable!("sink was just matched as workers");
+                };
+                drop(senders);
+                join_flush_workers(handles).await?;
+                Err(Error::io(
+                    "partition artifact flush worker stopped unexpectedly".to_string(),
+                ))
             }
-            None => partition.path = Some(final_relative_path),
-            _ => {}
+            FlushSink::Unstarted | FlushSink::Finished => Err(Error::invalid_input(
+                "partition artifact builder is already finished".to_string(),
+            )),
         }
-        partition.num_rows += total_rows;
-        append_partition_range(partition, file_offset, total_rows as u64);
-
-        let pq_codes = FixedSizeListArray::try_new_from_values(
-            UInt8Array::from(pq_values),
-            self.pq_code_width as i32,
-        )?;
-        self.write_bucket_batch(bucket_id, UInt64Array::from(row_ids), pq_codes, total_rows)
-            .await
-    }
-
-    /// Write a finalized bucket batch and update the bucket row count.
-    async fn write_bucket_batch(
-        &mut self,
-        bucket_id: usize,
-        row_ids: UInt64Array,
-        pq_codes: FixedSizeListArray,
-        total_rows: usize,
-    ) -> Result<()> {
-        let final_batch_start = Instant::now();
-        let final_batch = RecordBatch::try_new(
-            self.final_schema.clone(),
-            vec![Arc::new(row_ids), Arc::new(pq_codes)],
-        )?;
-        self.stats.final_batch_time += final_batch_start.elapsed();
-
-        let writer_start = Instant::now();
-        {
-            let writer = self.ensure_final_writer(bucket_id).await?;
-            writer.write_batch(&final_batch).await?;
-        }
-        self.stats.writer_time += writer_start.elapsed();
-        self.bucket_row_counts[bucket_id] += total_rows as u64;
-        Ok(())
-    }
-
-    /// Lazily create the finalized writer for a bucket.
-    ///
-    /// Buckets that never receive rows never create a file, which keeps sparse
-    /// artifacts compact.
-    async fn ensure_final_writer(&mut self, bucket_id: usize) -> Result<&mut FileWriter> {
-        if self.final_writers[bucket_id].is_none() {
-            let path = self.final_bucket_path(bucket_id);
-            let writer = file_versions::create_writer(
-                partition_artifact_file_version()?,
-                self.object_store.create(&path).await?,
-                Schema::try_from(self.final_schema.as_ref())?,
-                FileWriterOptions::default(),
-            )?;
-            self.final_writers[bucket_id] = Some(writer);
-        }
-        Ok(self.final_writers[bucket_id]
-            .as_mut()
-            .expect("final writer initialized"))
-    }
-
-    /// Path of the finalized file for one bucket.
-    fn final_bucket_path(&self, bucket_id: usize) -> Path {
-        self.root_dir
-            .clone()
-            .join(PARTITION_ARTIFACT_PARTITIONS_DIR)
-            .join(format!(
-                "{PARTITION_ARTIFACT_BUCKET_PREFIX}{bucket_id:05}.lance"
-            ))
-    }
-
-    /// Relative path recorded in the manifest for one finalized bucket.
-    fn final_bucket_relative_path(&self, bucket_id: usize) -> String {
-        format!(
-            "{PARTITION_ARTIFACT_PARTITIONS_DIR}/{PARTITION_ARTIFACT_BUCKET_PREFIX}{bucket_id:05}.lance"
-        )
     }
 
     fn log_stats(&self) {
+        let flush = &self.flush_stats;
         eprintln!(
-            "partition artifact builder stages: append_batches={} append_rows={} append_s={:.3} validate_s={:.3} extract_s={:.3} scatter_s={:.3} flushes={} flushed_rows={} single_flushes={} multi_flushes={} flush_s={:.3} final_batch_s={:.3} writer_s={:.3} finish_flush_s={:.3} writer_finish_s={:.3} manifest_s={:.3}",
+            "partition artifact builder stages: append_batches={} append_rows={} append_s={:.3} validate_s={:.3} extract_s={:.3} scatter_s={:.3} flushes={} flushed_rows={} single_flushes={} multi_flushes={} flush_s={:.3} final_batch_s={:.3} writer_s={:.3} finish_flush_s={:.3} writer_finish_s={:.3} manifest_s={:.3} flush_workers={} dispatch_s={:.3}",
             self.stats.append_batches,
             self.stats.append_rows,
             self.stats.append_time.as_secs_f64(),
             self.stats.validate_time.as_secs_f64(),
             self.stats.extract_time.as_secs_f64(),
             self.stats.scatter_time.as_secs_f64(),
-            self.stats.flushes,
-            self.stats.flushed_rows,
-            self.stats.single_partition_flushes,
-            self.stats.multi_partition_flushes,
-            self.stats.flush_time.as_secs_f64(),
-            self.stats.final_batch_time.as_secs_f64(),
-            self.stats.writer_time.as_secs_f64(),
+            flush.flushes,
+            flush.flushed_rows,
+            flush.single_partition_flushes,
+            flush.multi_partition_flushes,
+            flush.flush_time.as_secs_f64(),
+            flush.final_batch_time.as_secs_f64(),
+            flush.writer_time.as_secs_f64(),
             self.stats.finish_flush_time.as_secs_f64(),
-            self.stats.writer_finish_time.as_secs_f64(),
+            flush.writer_finish_time.as_secs_f64(),
             self.stats.manifest_time.as_secs_f64(),
+            self.flush_workers,
+            self.stats.dispatch_time.as_secs_f64(),
         );
     }
 }
@@ -1119,7 +1383,10 @@ mod tests {
 
         let object_store = Arc::new(ObjectStore::local());
         let root_path = Path::from_filesystem_path(&root_dir).unwrap();
-        let partition_path = root_path.clone().join("partitions").join("bucket-00000.lance");
+        let partition_path = root_path
+            .clone()
+            .join("partitions")
+            .join("bucket-00000.lance");
         let schema = Arc::new(arrow_schema::Schema::new(vec![
             arrow_schema::Field::new(ROW_ID, arrow_schema::DataType::UInt64, false),
             arrow_schema::Field::new(
@@ -1306,5 +1573,80 @@ mod tests {
         assert_eq!(manifest.partitions[0].ranges.len(), 1);
         assert_eq!(manifest.partitions[0].ranges[0].offset, 0);
         assert_eq!(manifest.partitions[0].ranges[0].num_rows, num_rows as u64);
+    }
+
+    /// Builds an artifact from the same input with a given number of flush workers.
+    async fn build_artifact_with_workers(
+        root_dir: &std::path::Path,
+        num_partitions: usize,
+        workers: usize,
+    ) -> Vec<String> {
+        fs::create_dir_all(root_dir).unwrap();
+        let object_store = Arc::new(ObjectStore::local());
+        let root_path = Path::from_filesystem_path(root_dir).unwrap();
+        let mut builder = PartitionArtifactBuilder::try_new_with_store(
+            object_store,
+            root_path,
+            num_partitions,
+            2,
+        )
+        .unwrap()
+        .with_flush_workers(workers);
+        // Rows concentrate on a few buckets so each is flushed several times.
+        let hot = [0u32, 1, 2, 3, 256, 257, 300 % num_partitions as u32];
+        let mut next_row = 0u64;
+        for batch_idx in 0..8u64 {
+            let rows = 50_000usize;
+            let row_ids = UInt64Array::from_iter_values(next_row..next_row + rows as u64);
+            next_row += rows as u64;
+            let part_ids =
+                UInt32Array::from_iter_values((0..rows).map(|i| {
+                    hot[(i * 7 + batch_idx as usize) % hot.len()] % num_partitions as u32
+                }));
+            let codes = FixedSizeListArray::try_new_from_values(
+                UInt8Array::from_iter_values((0..rows * 2).map(|i| (i % 251) as u8)),
+                2,
+            )
+            .unwrap();
+            let batch = RecordBatch::try_new(
+                Arc::new(ArrowSchema::new(vec![
+                    Field::new(ROW_ID, DataType::UInt64, false),
+                    Field::new(PART_ID_COLUMN, DataType::UInt32, false),
+                    Field::new(
+                        PQ_CODE_COLUMN,
+                        DataType::FixedSizeList(
+                            Arc::new(Field::new("item", DataType::UInt8, true)),
+                            2,
+                        ),
+                        true,
+                    ),
+                ])),
+                vec![Arc::new(row_ids), Arc::new(part_ids), Arc::new(codes)],
+            )
+            .unwrap();
+            builder.append_batch(&batch).await.unwrap();
+        }
+        builder.finish("metadata.lance", None).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn partition_artifact_flush_workers_match_inline_flush() {
+        for num_partitions in [300usize, 4] {
+            let tempdir = tempfile::tempdir().unwrap();
+            let inline_dir = tempdir.path().join("inline");
+            let inline_files = build_artifact_with_workers(&inline_dir, num_partitions, 0).await;
+            for workers in [1usize, 3] {
+                let dir = tempdir.path().join(format!("workers{workers}"));
+                let files = build_artifact_with_workers(&dir, num_partitions, workers).await;
+                assert_eq!(files, inline_files, "files with {workers} workers");
+                for file in &files {
+                    assert_eq!(
+                        fs::read(dir.join(file)).unwrap(),
+                        fs::read(inline_dir.join(file)).unwrap(),
+                        "{file} differs with {workers} workers ({num_partitions} partitions)"
+                    );
+                }
+            }
+        }
     }
 }

@@ -182,15 +182,14 @@ impl FileWriter {
     /// Schedule a batch and defer writing its pages behind up to `max_pending`
     /// earlier batches, so their encoding overlaps the writes. Output is
     /// identical to [`Self::write_batch`]; `write_pending` (or any other
-    /// operation on the writer) flushes the deferred batches. The v2.0 writer
-    /// has no deferral and writes the batch immediately.
+    /// operation on the writer) flushes the deferred batches.
     pub async fn write_batch_deferred(
         &mut self,
         batch: &RecordBatch,
         max_pending: usize,
     ) -> Result<()> {
         match self {
-            Self::V2_0(writer) => writer.write_batch(batch).await,
+            Self::V2_0(writer) => writer.write_batch_deferred(batch, max_pending).await,
             Self::V2_1(writer) => writer.write_batch_deferred(batch, max_pending).await,
             Self::V2_2(writer) => writer.write_batch_deferred(batch, max_pending).await,
             Self::V2_3(writer) => writer.write_batch_deferred(batch, max_pending).await,
@@ -200,7 +199,7 @@ impl FileWriter {
     /// Write every batch deferred by [`Self::write_batch_deferred`].
     pub async fn write_pending(&mut self) -> Result<()> {
         match self {
-            Self::V2_0(_) => Ok(()),
+            Self::V2_0(writer) => writer.write_pending().await,
             Self::V2_1(writer) => writer.write_pending().await,
             Self::V2_2(writer) => writer.write_pending().await,
             Self::V2_3(writer) => writer.write_pending().await,

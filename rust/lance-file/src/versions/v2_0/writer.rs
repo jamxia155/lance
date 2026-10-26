@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use core::panic;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -174,6 +174,8 @@ pub struct Writer {
     encoding_strategy: Box<dyn FieldEncodingStrategy>,
     options: FileWriterOptions,
     page_spill: Option<PageSpillState>,
+    /// Batches whose pages are being encoded but are not yet written.
+    pending: VecDeque<FuturesOrdered<EncodeTask>>,
 }
 
 fn initial_column_metadata() -> pbfile::ColumnMetadata {
@@ -217,6 +219,7 @@ impl Writer {
             page_spill: None,
             encoding_strategy: Box::new(ArrayFieldEncodingStrategy::new()),
             options,
+            pending: VecDeque::new(),
         }
     }
 
@@ -462,6 +465,50 @@ impl Writer {
     /// Note: the future returned by this method may complete before the data has been fully
     /// flushed to the file (some data may be in the data cache or the I/O cache)
     pub async fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        self.write_pending().await?;
+        if let Some(encoding_tasks) = self.schedule_batch(batch, false).await? {
+            self.write_pages(encoding_tasks).await?;
+        }
+        Ok(())
+    }
+
+    /// Schedule one record batch and defer writing its pages.
+    ///
+    /// The batch's pages are encoded in the background while up to
+    /// `max_pending` earlier batches wait to be written, always in the order
+    /// the batches were given. The output is identical to [`Self::write_batch`].
+    /// A batch whose encoding needs out-of-line buffers is rejected while any
+    /// earlier batch is unwritten. Any other operation on the writer first
+    /// writes all pending batches.
+    pub async fn write_batch_deferred(
+        &mut self,
+        batch: &RecordBatch,
+        max_pending: usize,
+    ) -> Result<()> {
+        let pages_pending = !self.pending.is_empty();
+        if let Some(tasks) = self.schedule_batch(batch, pages_pending).await? {
+            self.pending.push_back(tasks);
+        }
+        while self.pending.len() > max_pending {
+            let tasks = self.pending.pop_front().expect("pending is not empty");
+            self.write_pages(tasks).await?;
+        }
+        Ok(())
+    }
+
+    /// Write every batch scheduled by [`Self::write_batch_deferred`].
+    pub async fn write_pending(&mut self) -> Result<()> {
+        while let Some(tasks) = self.pending.pop_front() {
+            self.write_pages(tasks).await?;
+        }
+        Ok(())
+    }
+
+    async fn schedule_batch(
+        &mut self,
+        batch: &RecordBatch,
+        pages_pending: bool,
+    ) -> Result<Option<FuturesOrdered<EncodeTask>>> {
         debug!(
             "write_batch called with {} rows, {} columns, and {} bytes of data",
             batch.num_rows(),
@@ -480,7 +527,7 @@ impl Writer {
         let field_arrays = self.prepare_field_arrays(field_arrays)?;
         let num_rows = batch.num_rows() as u64;
         if num_rows == 0 {
-            return Ok(());
+            return Ok(None);
         }
         if num_rows > u32::MAX as u64 {
             return Err(Error::invalid_input_source(
@@ -491,10 +538,18 @@ impl Writer {
         // data to trigger an encoding task.  We collect any encoding tasks into a queue.
         let schedule_start = Instant::now();
         let mut external_buffers =
-            OutOfLineBuffers::new(self.tell().await?, PAGE_BUFFER_ALIGNMENT as u64);
+            OutOfLineBuffers::new(self.writer.tell().await? as u64, PAGE_BUFFER_ALIGNMENT as u64);
         let encoding_tasks = self.encode_columns(&field_arrays, &mut external_buffers)?;
         // Next, write external buffers
-        for external_buffer in external_buffers.take_buffers() {
+        let external = external_buffers.take_buffers();
+        if pages_pending && !external.is_empty() {
+            return Err(Error::internal(
+                "a pipelined batch produced out-of-line buffers while earlier pages were unwritten; \
+                 disable write pipelining for this schema"
+                    .to_string(),
+            ));
+        }
+        for external_buffer in external {
             Self::do_write_buffer(&mut self.writer, &external_buffer).await?;
         }
 
@@ -515,9 +570,7 @@ impl Writer {
         }
         self.rows_written += num_rows;
 
-        self.write_pages(encoding_tasks).await?;
-
-        Ok(())
+        Ok(Some(encoding_tasks))
     }
 
     /// Write a single column, advancing only that column's row counter.
@@ -550,6 +603,7 @@ impl Writer {
     /// # }
     /// ```
     pub async fn write_column(&mut self, column_index: usize, array: ArrayRef) -> Result<()> {
+        self.write_pending().await?;
         let schema = self.schema.as_ref().ok_or_else(|| {
             Error::invalid_input_source(
                 "write_column requires the writer to be created with an explicit schema".into(),
@@ -716,6 +770,7 @@ impl Writer {
     /// immediately.  This method returns the index of the global buffer (this will always
     /// start at 1 and increment by 1 each time this method is called)
     pub async fn add_global_buffer(&mut self, buffer: Bytes) -> Result<u32> {
+        self.write_pending().await?;
         let position = self.writer.tell().await? as u64;
         let len = buffer.len() as u64;
         Self::do_write_buffer(&mut self.writer, &buffer).await?;
@@ -782,6 +837,7 @@ impl Writer {
     /// Returns a summary of the completed file write.
     pub async fn finish(&mut self) -> Result<FileWriteSummary> {
         // 1. flush any remaining data and write out those pages
+        self.write_pending().await?;
         let mut external_buffers =
             OutOfLineBuffers::new(self.tell().await?, PAGE_BUFFER_ALIGNMENT as u64);
         let encoding_tasks = self
@@ -849,11 +905,13 @@ impl Writer {
     }
 
     pub async fn tell(&mut self) -> Result<u64> {
+        self.write_pending().await?;
         Ok(self.writer.tell().await? as u64)
     }
 
     /// Append a buffer whose metadata is supplied by the caller.
     pub async fn write_external_buffer(&mut self, bytes: &[u8]) -> Result<(u64, u64)> {
+        self.write_pending().await?;
         let start = self.tell().await?;
         self.writer.write_all(bytes).await?;
         Ok((start, bytes.len() as u64))

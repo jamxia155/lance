@@ -1975,6 +1975,7 @@ mod tests {
     }
     /// Deferring page writes behind later batches' encodes writes the same bytes.
     #[rstest]
+    #[case::v2_0(ConcreteFileVersion::V2_0)]
     #[case::v2_1(ConcreteFileVersion::V2_1)]
     #[case::v2_2(ConcreteFileVersion::V2_2)]
     #[case::v2_3(ConcreteFileVersion::V2_3)]
@@ -2073,7 +2074,7 @@ mod tests {
             let mut writer = create_writer(
                 obj_store.create(&tmp_path).await.unwrap(),
                 lance_schema,
-                ConcreteFileVersion::V2_1,
+                ConcreteFileVersion::V2_0,
                 FileWriterOptions::default(),
             )
             .unwrap();
@@ -2086,8 +2087,9 @@ mod tests {
                     writer.write_batch_deferred(&batch, max_pending).await.unwrap();
                 }
             }
-            writer.finish().await.unwrap();
+            let summary = writer.finish().await.unwrap();
             let secs = start.elapsed().as_secs_f64();
+            println!("file bytes per batch: {}", summary.size_bytes / count as u64);
             let t = crate::writer::write_timings();
             println!(
                 "pending={max_pending:>2}: {count} batches in {secs:.2}s = {:.2} ms/batch, {:.2} GB/s \

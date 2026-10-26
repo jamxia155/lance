@@ -2037,7 +2037,7 @@ mod tests {
     }
     /// Timing probe at merge_partitions' 1B partition size (~30K rows of
     /// 256-byte codes per batch). Run with `--ignored --nocapture`, in release.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     #[ignore]
     async fn bench_deferred_batch_writes() {
         let obj_store = Arc::new(ObjectStore::local());
@@ -2068,17 +2068,31 @@ mod tests {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(600);
+        let bench_version = match std::env::var("BENCH_VERSION").as_deref() {
+            Ok("2.1") => ConcreteFileVersion::V2_1,
+            Ok("2.2") => ConcreteFileVersion::V2_2,
+            Ok("2.3") => ConcreteFileVersion::V2_3,
+            _ => ConcreteFileVersion::V2_0,
+        };
+        // (user ticks, system ticks, minor page faults) of this process.
+        fn proc_stat() -> (u64, u64, u64) {
+            let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+            let after = &stat[stat.rfind(')').unwrap() + 2..];
+            let f: Vec<&str> = after.split_whitespace().collect();
+            (f[11].parse().unwrap(), f[12].parse().unwrap(), f[7].parse().unwrap())
+        }
         for max_pending in [0_usize, 1, 4, 16, 32] {
             let tmp_path = TempObjFile::default();
             let lance_schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
             let mut writer = create_writer(
                 obj_store.create(&tmp_path).await.unwrap(),
                 lance_schema,
-                ConcreteFileVersion::V2_0,
+                bench_version,
                 FileWriterOptions::default(),
             )
             .unwrap();
             crate::writer::reset_write_timings();
+            let proc_before = proc_stat();
             let start = std::time::Instant::now();
             for _ in 0..count {
                 if max_pending == 0 {
@@ -2089,7 +2103,14 @@ mod tests {
             }
             let summary = writer.finish().await.unwrap();
             let secs = start.elapsed().as_secs_f64();
-            println!("file bytes per batch: {}", summary.size_bytes / count as u64);
+            let proc_after = proc_stat();
+            println!(
+                "file bytes per batch: {}; cpu user {:.2}s sys {:.2}s, minor faults {}",
+                summary.size_bytes / count as u64,
+                (proc_after.0 - proc_before.0) as f64 / 100.0,
+                (proc_after.1 - proc_before.1) as f64 / 100.0,
+                proc_after.2 - proc_before.2
+            );
             let t = crate::writer::write_timings();
             println!(
                 "pending={max_pending:>2}: {count} batches in {secs:.2}s = {:.2} ms/batch, {:.2} GB/s \

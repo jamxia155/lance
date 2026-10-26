@@ -2034,4 +2034,71 @@ mod tests {
             assert_eq!(&outputs[0], output);
         }
     }
+    /// Timing probe at merge_partitions' 1B partition size (~30K rows of
+    /// 256-byte codes per batch). Run with `--ignored --nocapture`, in release.
+    #[tokio::test]
+    #[ignore]
+    async fn bench_deferred_batch_writes() {
+        let obj_store = Arc::new(ObjectStore::local());
+        let width = 256_i32;
+        let rows = 30_500_usize;
+        let arrow_schema = Arc::new(Schema::new(vec![
+            Field::new("_rowid", DataType::UInt64, false),
+            Field::new(
+                "pq_code",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::UInt8, true)),
+                    width,
+                ),
+                true,
+            ),
+        ]));
+        let ids = UInt64Array::from_iter_values(0..rows as u64);
+        let bytes = arrow_array::UInt8Array::from_iter_values(
+            (0..rows * width as usize).map(|b| (b as u64).wrapping_mul(2_654_435_761) as u8),
+        );
+        let codes = FixedSizeListArray::try_new_from_values(bytes, width).unwrap();
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(ids) as ArrayRef, Arc::new(codes) as ArrayRef],
+        )
+        .unwrap();
+        let count: usize = std::env::var("BENCH_BATCHES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(600);
+        for max_pending in [0_usize, 1, 4, 16, 32] {
+            let tmp_path = TempObjFile::default();
+            let lance_schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
+            let mut writer = create_writer(
+                obj_store.create(&tmp_path).await.unwrap(),
+                lance_schema,
+                ConcreteFileVersion::V2_1,
+                FileWriterOptions::default(),
+            )
+            .unwrap();
+            crate::writer::reset_write_timings();
+            let start = std::time::Instant::now();
+            for _ in 0..count {
+                if max_pending == 0 {
+                    writer.write_batch(&batch).await.unwrap();
+                } else {
+                    writer.write_batch_deferred(&batch, max_pending).await.unwrap();
+                }
+            }
+            writer.finish().await.unwrap();
+            let secs = start.elapsed().as_secs_f64();
+            let t = crate::writer::write_timings();
+            println!(
+                "pending={max_pending:>2}: {count} batches in {secs:.2}s = {:.2} ms/batch, {:.2} GB/s \
+                 (schedule {:.2}s encode_wait {:.2}s page_write {:.2}s flush {:.2}s)",
+                secs * 1e3 / count as f64,
+                count as f64 * rows as f64 * 264.0 / secs / 1e9,
+                t.schedule.as_secs_f64(),
+                t.encode_wait.as_secs_f64(),
+                t.page_write.as_secs_f64(),
+                t.flush.as_secs_f64(),
+            );
+        }
+    }
 }

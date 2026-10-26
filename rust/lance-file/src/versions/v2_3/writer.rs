@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::sync::Arc;
+use std::{collections::VecDeque, sync::Arc};
 
 use arrow_array::{ArrayRef, RecordBatch};
 use bytes::{BufMut, Bytes};
+use futures::stream::FuturesOrdered;
 use lance_core::{Result, datatypes::Schema};
 use lance_encoding::{
     compression_config::CompressionParams,
-    encoder::{BatchEncoder, EncodedBatch},
+    encoder::{BatchEncoder, EncodeTask, EncodedBatch},
 };
 use lance_io::{object_store::ObjectStore, traits::Writer as ObjectWriter};
 use object_store::path::Path;
@@ -33,6 +34,8 @@ pub struct Writer {
     sink: StructuralFileSink,
     encoding: EncodingPipeline,
     compression: CompressionParams,
+    /// Batches whose pages are being encoded but are not yet written.
+    pending: VecDeque<FuturesOrdered<EncodeTask>>,
 }
 
 impl Writer {
@@ -72,6 +75,7 @@ impl Writer {
             sink: StructuralFileSink::new(object_writer),
             encoding: EncodingPipeline::new(options),
             compression,
+            pending: VecDeque::new(),
         }
     }
 
@@ -111,12 +115,51 @@ impl Writer {
 
     /// Schedule one record batch for writing.
     pub async fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        self.write_pending().await?;
         self.ensure_initialized(batch)?;
         self.encoding.write_batch(batch, &mut self.sink).await
     }
 
+    /// Schedule one record batch and defer writing its pages.
+    ///
+    /// The batch's pages are encoded in the background while up to
+    /// `max_pending` earlier batches wait to be written, always in the order
+    /// the batches were given. The output is identical to [`Self::write_batch`].
+    /// A batch whose encoding needs out-of-line buffers is rejected while any
+    /// earlier batch is unwritten. Any other operation on the writer first
+    /// writes all pending batches.
+    pub async fn write_batch_deferred(
+        &mut self,
+        batch: &RecordBatch,
+        max_pending: usize,
+    ) -> Result<()> {
+        self.ensure_initialized(batch)?;
+        let pages_pending = !self.pending.is_empty();
+        if let Some(tasks) = self
+            .encoding
+            .schedule_batch(batch, &mut self.sink, pages_pending)
+            .await?
+        {
+            self.pending.push_back(tasks);
+        }
+        while self.pending.len() > max_pending {
+            let tasks = self.pending.pop_front().expect("pending is not empty");
+            self.sink.write_pages(tasks).await?;
+        }
+        Ok(())
+    }
+
+    /// Write every batch scheduled by [`Self::write_batch_deferred`].
+    pub async fn write_pending(&mut self) -> Result<()> {
+        while let Some(tasks) = self.pending.pop_front() {
+            self.sink.write_pages(tasks).await?;
+        }
+        Ok(())
+    }
+
     /// Write one top-level field, advancing only that field's row count.
     pub async fn write_column(&mut self, column_index: usize, array: ArrayRef) -> Result<()> {
+        self.write_pending().await?;
         self.encoding
             .write_column(column_index, array, &mut self.sink)
             .await
@@ -124,6 +167,7 @@ impl Writer {
 
     /// Append a buffer whose page or column metadata is supplied externally.
     pub async fn write_external_buffer(&mut self, bytes: &[u8]) -> Result<(u64, u64)> {
+        self.write_pending().await?;
         self.sink.write_external_buffer(bytes).await
     }
 
@@ -146,11 +190,13 @@ impl Writer {
 
     /// Add an arbitrary global buffer and return its one-based index.
     pub async fn add_global_buffer(&mut self, buffer: Bytes) -> Result<u32> {
+        self.write_pending().await?;
         self.sink.add_global_buffer(buffer).await
     }
 
     /// Finish the v2.3 file and close its object writer.
     pub async fn finish(&mut self) -> Result<FileWriteSummary> {
+        self.write_pending().await?;
         // The order below is the v2.3 wire contract.
         self.encoding.flush(&mut self.sink).await?;
         self.encoding.finish_encoders(&mut self.sink).await?;
@@ -192,6 +238,7 @@ impl Writer {
 
     /// Return the current object-writer position.
     pub async fn tell(&mut self) -> Result<u64> {
+        self.write_pending().await?;
         self.sink.tell().await
     }
 

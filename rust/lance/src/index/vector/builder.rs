@@ -148,6 +148,24 @@ const PARTITION_BUILD_ENTRIES_PER_WORKER: usize = 2;
 /// Overrides the decoded-byte target of one partition read window, for
 /// experiments on how window size limits merge concurrency.
 const PARTITION_WINDOW_BYTES_ENV: &str = "LANCE_PARTITION_WINDOW_BYTES";
+/// Number of partitions whose pages `merge_partitions` lets encode in the
+/// background while earlier partitions are being written. `0` (the default)
+/// writes each partition before starting the next.
+const MERGE_WRITE_PIPELINE_ENV: &str = "LANCE_MERGE_WRITE_PIPELINE";
+
+fn merge_write_pipeline_from_env() -> Result<usize> {
+    match std::env::var(MERGE_WRITE_PIPELINE_ENV) {
+        Ok(value) => value.trim().parse::<usize>().map_err(|_| {
+            Error::invalid_input(format!(
+                "{MERGE_WRITE_PIPELINE_ENV} must be a non-negative integer, got {value:?}"
+            ))
+        }),
+        Err(std::env::VarError::NotPresent) => Ok(0),
+        Err(std::env::VarError::NotUnicode(value)) => Err(Error::invalid_input(format!(
+            "{MERGE_WRITE_PIPELINE_ENV} must contain a UTF-8 integer, got {value:?}"
+        ))),
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 struct FreshPartitionBuildLimits {
@@ -1940,8 +1958,16 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let mut index_batch_time = Duration::default();
         let mut index_write_time = Duration::default();
         let progress = self.progress.clone();
+        let write_pipeline = merge_write_pipeline_from_env()?;
+        let mut stream_wait_time = Duration::default();
         log::info!("merging {} partitions", num_partitions);
-        while let Some(result) = build_stream.try_next().await? {
+        loop {
+            let stream_wait_start = Instant::now();
+            let Some(result) = build_stream.try_next().await? else {
+                stream_wait_time += stream_wait_start.elapsed();
+                break;
+            };
+            stream_wait_time += stream_wait_start.elapsed();
             let partition_id = result.value.partition_id;
             ordered_results.push(partition_id, result)?;
 
@@ -2016,11 +2042,16 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                             )?);
                         }
                         let storage_write_start = Instant::now();
-                        storage_writer
+                        let storage_writer = storage_writer
                             .as_mut()
-                            .expect("storage writer must be initialized before write")
-                            .write_batch(&batch)
-                            .await?;
+                            .expect("storage writer must be initialized before write");
+                        if write_pipeline == 0 {
+                            storage_writer.write_batch(&batch).await?;
+                        } else {
+                            storage_writer
+                                .write_batch_deferred(&batch, write_pipeline)
+                                .await?;
+                        }
                         storage_write_time += storage_write_start.elapsed();
                         storage_ivf.add_partition(batch.num_rows() as u32);
                     }
@@ -2097,6 +2128,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let storage_writer = storage_writer
             .as_mut()
             .expect("storage writer must be initialized before final metadata write");
+        let drain_start = Instant::now();
+        storage_writer.write_pending().await?;
+        storage_write_time += drain_start.elapsed();
         let storage_ivf_pb = pb::Ivf::try_from(&storage_ivf)?;
         storage_writer.add_schema_metadata(DISTANCE_TYPE_KEY, self.distance_type.to_string());
         let ivf_buffer_pos = storage_writer
@@ -2161,7 +2195,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let finish_time = finish_start.elapsed();
 
         eprintln!(
-            "lance vector merge_partitions stages: partitions={} take_s={:.3} build_s={:.3} storage_batches_s={:.3} storage_write_s={:.3} index_batch_s={:.3} index_write_s={:.3} finish_s={:.3}",
+            "lance vector merge_partitions stages: partitions={} take_s={:.3} build_s={:.3} storage_batches_s={:.3} storage_write_s={:.3} index_batch_s={:.3} index_write_s={:.3} finish_s={:.3} stream_wait_s={:.3} write_pipeline={}",
             ivf.num_partitions(),
             self.partition_build_times.take_time().as_secs_f64(),
             self.partition_build_times.build_time().as_secs_f64(),
@@ -2170,6 +2204,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             index_batch_time.as_secs_f64(),
             index_write_time.as_secs_f64(),
             finish_time.as_secs_f64(),
+            stream_wait_time.as_secs_f64(),
+            write_pipeline,
         );
 
         eprintln!(

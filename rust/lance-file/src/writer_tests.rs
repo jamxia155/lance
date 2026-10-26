@@ -23,7 +23,7 @@ mod tests {
     use arrow_schema::{
         DataType, Field, Field as ArrowField, Fields as ArrowFields, Schema, Schema as ArrowSchema,
     };
-    use lance_arrow::ARROW_EXT_NAME_KEY;
+    use lance_arrow::{ARROW_EXT_NAME_KEY, FixedSizeListArrayExt};
     use lance_arrow::json::{ARROW_JSON_EXT_NAME, JSON_EXT_NAME, JsonArray, json_field};
     use lance_core::cache::LanceCache;
     use lance_core::datatypes::Schema as LanceSchema;
@@ -1972,5 +1972,66 @@ mod tests {
             write_and_read_batches(&batches, Some((spill_store, spill_path.as_ref().clone())))
                 .await;
         assert_eq!(baseline, spilled);
+    }
+    /// Deferring page writes behind later batches' encodes writes the same bytes.
+    #[rstest]
+    #[case::v2_1(ConcreteFileVersion::V2_1)]
+    #[case::v2_2(ConcreteFileVersion::V2_2)]
+    #[case::v2_3(ConcreteFileVersion::V2_3)]
+    #[tokio::test]
+    async fn test_deferred_batch_writes_match_inline(#[case] version: ConcreteFileVersion) {
+        let obj_store = Arc::new(ObjectStore::local());
+        let width = 256_i32;
+        let arrow_schema = Arc::new(Schema::new(vec![
+            Field::new("_rowid", DataType::UInt64, false),
+            Field::new(
+                "pq_code",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::UInt8, true)),
+                    width,
+                ),
+                true,
+            ),
+        ]));
+        let batches = (0..24_u64)
+            .map(|i| {
+                let rows = 500 + (i as usize * 37) % 400;
+                let ids = UInt64Array::from_iter_values((0..rows as u64).map(|r| i * 10_000 + r));
+                let bytes = arrow_array::UInt8Array::from_iter_values(
+                    (0..rows * width as usize).map(|b| (b as u64 * 31 + i * 7) as u8),
+                );
+                let codes = FixedSizeListArray::try_new_from_values(bytes, width).unwrap();
+                RecordBatch::try_new(
+                    arrow_schema.clone(),
+                    vec![Arc::new(ids) as ArrayRef, Arc::new(codes) as ArrayRef],
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        let mut outputs = Vec::new();
+        for max_pending in [None, Some(0), Some(1), Some(4), Some(100)] {
+            let tmp_path = TempObjFile::default();
+            let lance_schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
+            let mut writer = create_writer(
+                obj_store.create(&tmp_path).await.unwrap(),
+                lance_schema,
+                version,
+                FileWriterOptions::default(),
+            )
+            .unwrap();
+            for batch in &batches {
+                match max_pending {
+                    None => writer.write_batch(batch).await.unwrap(),
+                    Some(n) => writer.write_batch_deferred(batch, n).await.unwrap(),
+                }
+            }
+            writer.add_schema_metadata("foo", "bar");
+            writer.finish().await.unwrap();
+            outputs.push(obj_store.read_one_all(&tmp_path).await.unwrap());
+        }
+        for output in &outputs[1..] {
+            assert_eq!(&outputs[0], output);
+        }
     }
 }

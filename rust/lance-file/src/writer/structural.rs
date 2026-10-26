@@ -664,6 +664,26 @@ impl EncodingPipeline {
         batch: &RecordBatch,
         sink: &mut StructuralFileSink,
     ) -> Result<()> {
+        match self.schedule_batch(batch, sink, false).await? {
+            Some(encoding_tasks) => sink.write_pages(encoding_tasks).await,
+            None => Ok(()),
+        }
+    }
+
+    /// Start encoding `batch` and return its pending page encodes, in order.
+    ///
+    /// The pages are not written until the caller hands the tasks to
+    /// [`StructuralFileSink::write_pages`], and the caller must do so in the
+    /// order the batches were scheduled. Out-of-line buffers are positioned
+    /// from the sink's current offset, so when earlier batches are still
+    /// unwritten (`pages_pending`) a batch that needs one cannot be scheduled
+    /// and is rejected instead of being written at a stale offset.
+    pub async fn schedule_batch(
+        &mut self,
+        batch: &RecordBatch,
+        sink: &mut StructuralFileSink,
+        pages_pending: bool,
+    ) -> Result<Option<FuturesOrdered<EncodeTask>>> {
         debug!(
             "write_batch called with {} rows, {} columns, and {} bytes of data",
             batch.num_rows(),
@@ -680,7 +700,7 @@ impl EncodingPipeline {
         self.verify_nullability_constraints(batch)?;
         let num_rows = batch.num_rows() as u64;
         if num_rows == 0 {
-            return Ok(());
+            return Ok(None);
         }
         if num_rows > u32::MAX as u64 {
             return Err(Error::invalid_input_source(
@@ -692,7 +712,15 @@ impl EncodingPipeline {
         let mut external_buffers =
             OutOfLineBuffers::new(sink.tell().await?, PAGE_BUFFER_ALIGNMENT as u64);
         let encoding_tasks = self.encode_batch(batch, &mut external_buffers)?;
-        for external_buffer in external_buffers.take_buffers() {
+        let external = external_buffers.take_buffers();
+        if pages_pending && !external.is_empty() {
+            return Err(Error::internal(
+                "a pipelined batch produced out-of-line buffers while earlier pages were unwritten; \
+                 disable write pipelining for this schema"
+                    .to_string(),
+            ));
+        }
+        for external_buffer in external {
             sink.write_aligned_buffer(&external_buffer).await?;
         }
         let encoding_tasks = encoding_tasks
@@ -711,7 +739,7 @@ impl EncodingPipeline {
             *field_rows += num_rows;
         }
         self.rows_written += num_rows;
-        sink.write_pages(encoding_tasks).await
+        Ok(Some(encoding_tasks))
     }
 
     pub async fn write_column(

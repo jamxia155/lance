@@ -148,6 +148,9 @@ const PARTITION_BUILD_ENTRIES_PER_WORKER: usize = 2;
 /// Overrides the decoded-byte target of one partition read window, for
 /// experiments on how window size limits merge concurrency.
 const PARTITION_WINDOW_BYTES_ENV: &str = "LANCE_PARTITION_WINDOW_BYTES";
+/// Overrides the decoded-byte budget shared by active partition builds and completed partitions
+/// waiting to be written, which bounds how many partition reads are in flight.
+const PARTITION_BUILD_BUDGET_BYTES_ENV: &str = "LANCE_PARTITION_BUILD_BUDGET_BYTES";
 /// Number of partitions whose pages `merge_partitions` lets encode in the
 /// background while earlier partitions are being written. `0` (the default)
 /// writes each partition before starting the next.
@@ -204,6 +207,26 @@ impl FreshPartitionBuildLimits {
             Err(std::env::VarError::NotUnicode(value)) => {
                 return Err(Error::invalid_input(format!(
                     "{PARTITION_WINDOW_BYTES_ENV} must contain a UTF-8 integer number of bytes, got {value:?}"
+                )));
+            }
+        }
+        match std::env::var(PARTITION_BUILD_BUDGET_BYTES_ENV) {
+            Ok(value) => {
+                limits.decoded_budget_bytes = value
+                    .trim()
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|bytes| *bytes > 0)
+                    .ok_or_else(|| {
+                        Error::invalid_input(format!(
+                            "{PARTITION_BUILD_BUDGET_BYTES_ENV} must be a positive integer number of bytes, got {value:?}"
+                        ))
+                    })?;
+            }
+            Err(std::env::VarError::NotPresent) => {}
+            Err(std::env::VarError::NotUnicode(value)) => {
+                return Err(Error::invalid_input(format!(
+                    "{PARTITION_BUILD_BUDGET_BYTES_ENV} must contain a UTF-8 integer number of bytes, got {value:?}"
                 )));
             }
         }

@@ -119,6 +119,35 @@ fn partition_artifact_flush_workers() -> usize {
         .unwrap_or(PARTITION_ARTIFACT_FLUSH_WORKERS_DEFAULT)
 }
 
+/// Reads a positive integer from the environment variable `name`, falling back to `default` when
+/// it is unset, unparsable or zero.
+fn positive_env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+/// Number of bucket files the artifact is split into, from `LANCE_PARTITION_ARTIFACT_BUCKETS`
+/// (default 256). Partition `p` goes to bucket `p % buckets`.
+fn partition_artifact_buckets() -> usize {
+    positive_env_usize(
+        "LANCE_PARTITION_ARTIFACT_BUCKETS",
+        PARTITION_ARTIFACT_DEFAULT_BUCKETS,
+    )
+}
+
+/// Rows a bucket buffers before it is flushed, from `LANCE_PARTITION_ARTIFACT_BUCKET_BUFFER_ROWS`
+/// (default 32K). Each flush adds one contiguous range per partition in the bucket, so larger
+/// buffers mean fewer, larger ranges per partition at merge time, for more memory in flight.
+fn partition_artifact_bucket_buffer_rows() -> usize {
+    positive_env_usize(
+        "LANCE_PARTITION_ARTIFACT_BUCKET_BUFFER_ROWS",
+        PARTITION_ARTIFACT_BUCKET_BUFFER_ROWS,
+    )
+}
+
 #[derive(Default, Debug)]
 struct PartitionArtifactBuilderStats {
     append_batches: usize,
@@ -491,6 +520,7 @@ pub struct PartitionArtifactBuilder {
     /// Rows handed to the flush so far per bucket, which is where the next flush starts.
     bucket_row_counts: Vec<u64>,
     flush_workers: usize,
+    bucket_buffer_rows: usize,
     sink: FlushSink,
     stats: PartitionArtifactBuilderStats,
     flush_stats: FlushStats,
@@ -549,9 +579,7 @@ impl PartitionArtifactBuilder {
             ));
         }
 
-        let num_buckets = num_partitions
-            .min(PARTITION_ARTIFACT_DEFAULT_BUCKETS)
-            .max(1);
+        let num_buckets = num_partitions.min(partition_artifact_buckets()).max(1);
         let final_schema = Arc::new(ArrowSchema::new(vec![
             Field::new(ROW_ID, DataType::UInt64, false),
             Field::new(
@@ -576,6 +604,7 @@ impl PartitionArtifactBuilder {
             buffers: (0..num_buckets).map(|_| BucketBuffer::default()).collect(),
             bucket_row_counts: vec![0; num_buckets],
             flush_workers: partition_artifact_flush_workers().min(num_buckets),
+            bucket_buffer_rows: partition_artifact_bucket_buffer_rows(),
             sink: FlushSink::Unstarted,
             stats: PartitionArtifactBuilderStats::default(),
             flush_stats: FlushStats::default(),
@@ -624,7 +653,7 @@ impl PartitionArtifactBuilder {
             let start = row_idx * pq_code_width;
             let end = start + pq_code_width;
             buffer.pq_values.extend_from_slice(&pq_values[start..end]);
-            if buffer.len() >= PARTITION_ARTIFACT_BUCKET_BUFFER_ROWS {
+            if buffer.len() >= self.bucket_buffer_rows {
                 let dispatch_start = Instant::now();
                 self.flush_bucket(bucket_id).await?;
                 self.stats.dispatch_time += dispatch_start.elapsed();
@@ -994,7 +1023,11 @@ impl PartitionArtifactShuffleReader {
         // deliberately the store's pre-existing default, not a value we
         // invented -- it's what this stage always used before `LANCE_IO_
         // THREADS` started leaking into it.
-        let io_capacity = object_store.default_io_parallelism();
+        // `LANCE_PARTITION_ARTIFACT_IO_PARALLELISM` overrides it for this stage only.
+        let io_capacity = positive_env_usize(
+            "LANCE_PARTITION_ARTIFACT_IO_PARALLELISM",
+            object_store.default_io_parallelism(),
+        );
         let scheduler = ScanScheduler::new(
             object_store.clone(),
             SchedulerConfig::new(32 * 1024 * 1024 * io_capacity as u64)
